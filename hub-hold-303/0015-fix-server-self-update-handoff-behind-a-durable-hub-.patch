@@ -1,0 +1,265 @@
+From 6f3ff1417f55be6b3589f4c1c9a67f6ab2a41ba9 Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 06:27:37 -0700
+Subject: [PATCH 15/15] fix(server): self-update handoff behind a durable
+ hub-hold barrier (#303)
+
+Independent review NO-GO blocker: the guard ignored pending non-holdable
+effects and checked counts separately from the handoff. Every update path now
+sets the hub hold (actor self-update) before counting, refuses unless queued,
+in-flight, outbox-pending and claimed are all zero, and clears a hold it set
+on refusal or a failed handoff. After a handoff the hold stays set across the
+restart until an operator clears it.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/server/src/cloud/selfUpdate.test.ts | 68 +++++++++++++++--
+ apps/server/src/cloud/selfUpdate.ts      | 94 +++++++++++++++---------
+ 2 files changed, 124 insertions(+), 38 deletions(-)
+
+diff --git a/apps/server/src/cloud/selfUpdate.test.ts b/apps/server/src/cloud/selfUpdate.test.ts
+index 8e301e9ae..dabc943e5 100644
+--- a/apps/server/src/cloud/selfUpdate.test.ts
++++ b/apps/server/src/cloud/selfUpdate.test.ts
+@@ -39,6 +39,8 @@ const quiescentCounts = {
+   heldEffects: 0,
+ };
+ 
++const idleHold = { held: false, actor: null, reason: null, changedAt: null };
++
+ const hubHoldInventory = (counts: Partial<typeof quiescentCounts>) =>
+   Effect.succeed({
+     runtime: { version: "1.0.0", entryPath: null, bundleSha256: null },
+@@ -147,6 +149,9 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
+       : Effect.provide(
+           Layer.mock(HubHold.HubHoldV2)({
+             inventory: hubHoldInventory({}),
++            read: Effect.succeed(idleHold),
++            set: () => Effect.succeed({ ...idleHold, held: true }),
++            clear: () => Effect.succeed(idleHold),
+             ...options.hubHold,
+           }),
+         ),
+@@ -479,7 +484,7 @@ it.layer(NodeServices.layer)("server self update", (it) => {
+     ["queued", { queued: 2 }],
+     ["in flight", { inFlight: 1 }],
+     ["claimed", { outboxRunning: 3 }],
+-    ["held", { heldEffects: 4 }],
++    ["outbox pending", { outboxPending: 4 }],
+   ] as const) {
+     it.effect(`refuses an update while ${label} provider work is pending`, () =>
+       Effect.gen(function* () {
+@@ -493,11 +498,11 @@ it.layer(NodeServices.layer)("server self update", (it) => {
+         const {
+           queued = 0,
+           inFlight = 0,
++          outboxPending = 0,
+           outboxRunning = 0,
+-          heldEffects = 0,
+         } = counts as Record<string, number>;
+         expect(failure.reason).toContain(
+-          `(queued ${queued}, in flight ${inFlight}, claimed ${outboxRunning}, held ${heldEffects})`,
++          `(queued ${queued}, in flight ${inFlight}, outbox pending ${outboxPending}, claimed ${outboxRunning})`,
+         );
+         expect(order).not.toContain("accept");
+       }),
+@@ -524,11 +529,64 @@ it.layer(NodeServices.layer)("server self update", (it) => {
+   it.effect("proceeds to the launcher when no provider work is pending", () =>
+     Effect.gen(function* () {
+       const { selfUpdate, order } = yield* makeHarness({
+-        hubHold: { inventory: hubHoldInventory({ held: 5, outboxPending: 2 }) },
++        hubHold: { inventory: hubHoldInventory({ held: 5 }) },
+       });
+-      // Idle queued-resume runs and ordinary pending effects do not block.
++      // Idle queued runs waiting for an explicit resume do not block.
+       expect((yield* selfUpdate.update({ targetVersion: "1.1.0" })).updateId).toBe("launcher-id");
+       expect(order).toContain("accept");
+     }),
+   );
++
++  it.effect("sets the hold before counting and keeps it across a handoff", () =>
++    Effect.gen(function* () {
++      const calls: Array<string> = [];
++      const { selfUpdate } = yield* makeHarness({
++        hubHold: {
++          set: (input) =>
++            Effect.sync(() => calls.push(`set:${input.actor}`)).pipe(
++              Effect.as({ ...idleHold, held: true }),
++            ),
++          clear: () => Effect.sync(() => calls.push("clear")).pipe(Effect.as(idleHold)),
++          inventory: Effect.sync(() => calls.push("count")).pipe(
++            Effect.andThen(hubHoldInventory({})),
++          ),
++        },
++      });
++      yield* selfUpdate.update({ targetVersion: "1.1.0" });
++      expect(calls).toEqual(["set:self-update", "count"]);
++    }),
++  );
++
++  it.effect("clears a hold it set when the update is refused", () =>
++    Effect.gen(function* () {
++      const calls: Array<string> = [];
++      const { selfUpdate } = yield* makeHarness({
++        hubHold: {
++          set: () =>
++            Effect.sync(() => calls.push("set")).pipe(Effect.as({ ...idleHold, held: true })),
++          clear: () => Effect.sync(() => calls.push("clear")).pipe(Effect.as(idleHold)),
++          inventory: hubHoldInventory({ inFlight: 1 }),
++        },
++      });
++      yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip);
++      expect(calls).toEqual(["set", "clear"]);
++    }),
++  );
++
++  it.effect("leaves an operator's hold alone when the update is refused", () =>
++    Effect.gen(function* () {
++      const calls: Array<string> = [];
++      const { selfUpdate } = yield* makeHarness({
++        hubHold: {
++          read: Effect.succeed({ ...idleHold, held: true, actor: "operator" }),
++          set: () =>
++            Effect.sync(() => calls.push("set")).pipe(Effect.as({ ...idleHold, held: true })),
++          clear: () => Effect.sync(() => calls.push("clear")).pipe(Effect.as(idleHold)),
++          inventory: hubHoldInventory({ queued: 1 }),
++        },
++      });
++      yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip);
++      expect(calls).toEqual([]);
++    }),
++  );
+ });
+diff --git a/apps/server/src/cloud/selfUpdate.ts b/apps/server/src/cloud/selfUpdate.ts
+index c2037adb7..d752f32dd 100644
+--- a/apps/server/src/cloud/selfUpdate.ts
++++ b/apps/server/src/cloud/selfUpdate.ts
+@@ -188,25 +188,55 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
+   const inFlight = yield* Ref.make(false);
+   const hubHold = yield* Effect.serviceOption(HubHold.HubHoldV2);
+   // 0.1.0 has no setting that turns self-update off, so every update path
+-  // fails closed unless the dispatch inventory is readable and shows no
+-  // provider work that a restart would cut: nothing queued to start, in
+-  // flight, claimed, or waiting on the hub hold.
+-  const requireQuiescentHub = Effect.gen(function* () {
+-    if (Option.isNone(hubHold)) {
+-      return yield* failWith("Server updates are blocked: the dispatch inventory is unavailable.");
+-    }
+-    const inventory = yield* hubHold.value.inventory.pipe(
+-      Effect.mapError((cause) =>
+-        failWith("Server updates are blocked: the dispatch inventory could not be read.", cause),
+-      ),
+-    );
+-    const { queued, inFlight: running, outboxRunning, heldEffects } = inventory.counts;
+-    if (queued + running + outboxRunning + heldEffects > 0) {
+-      return yield* failWith(
+-        `Server updates are blocked while provider work is pending (queued ${queued}, in flight ${running}, claimed ${outboxRunning}, held ${heldEffects}).`,
++  // goes through this barrier and fails closed. It sets the hub hold before
++  // counting, so a message accepted after the count stays durable and cannot
++  // reach a provider before the restart. The handoff runs only when nothing is
++  // queued, in flight, claimed or pending in the outbox (interrupts and
++  // approval answers included). On refusal or a failed handoff the barrier
++  // clears a hold it set; after a handoff the hold stays set across the
++  // restart until an operator clears it.
++  const withUpdateBarrier = <A, E, R>(handoff: Effect.Effect<A, E, R>) =>
++    Effect.gen(function* () {
++      if (Option.isNone(hubHold)) {
++        return yield* failWith(
++          "Server updates are blocked: the dispatch inventory is unavailable.",
++        );
++      }
++      const hold = hubHold.value;
++      const before = yield* hold.read.pipe(
++        Effect.mapError((cause) =>
++          failWith("Server updates are blocked: the hub hold could not be read.", cause),
++        ),
+       );
+-    }
+-  });
++      if (!before.held) {
++        yield* hold
++          .set({ actor: "self-update", reason: "Holding dispatch for a server update handoff." })
++          .pipe(
++            Effect.mapError((cause) =>
++              failWith("Server updates are blocked: the hub hold could not be set.", cause),
++            ),
++          );
++      }
++      const release = before.held
++        ? Effect.void
++        : hold
++            .clear({ actor: "self-update", reason: "The server update did not hand off." })
++            .pipe(Effect.ignore);
++      const inventory = yield* hold.inventory.pipe(
++        Effect.mapError((cause) =>
++          failWith("Server updates are blocked: the dispatch inventory could not be read.", cause),
++        ),
++        Effect.tapError(() => release),
++      );
++      const { queued, inFlight: running, outboxPending, outboxRunning } = inventory.counts;
++      if (queued + running + outboxPending + outboxRunning > 0) {
++        yield* release;
++        return yield* failWith(
++          `Server updates are blocked while provider work is pending (queued ${queued}, in flight ${running}, outbox pending ${outboxPending}, claimed ${outboxRunning}).`,
++        );
++      }
++      return yield* handoff.pipe(Effect.onError(() => release));
++    });
+ 
+   const capability: ServerSelfUpdateCapability | null =
+     serverConfig.mode === "desktop" ? "desktop-managed" : launcher.managed ? "boot-service" : null;
+@@ -223,8 +253,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
+       // update feed decides what it downloads, and the result carries what
+       // it actually got.
+       if (desktopAppUpdate.available) {
+-        yield* requireQuiescentHub;
+-        return yield* desktopAppUpdate.run(reportProgress);
++        return yield* withUpdateBarrier(desktopAppUpdate.run(reportProgress));
+       }
+       return yield* failWith(
+         "This server is managed by the T3 Code desktop app on its machine; update the desktop app to update it.",
+@@ -333,19 +362,20 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
+         ),
+       );
+ 
+-      yield* requireQuiescentHub;
+       yield* reportProgress("installing");
+-      const updateId = yield* Effect.uninterruptible(
+-        launcher.requestUpdate({ targetVersion, dbPath: serverConfig.dbPath }).pipe(
+-          Effect.mapError((error) =>
+-            failWith(
+-              error._tag === "ServiceLauncherRejectedError"
+-                ? error.reason
+-                : "Could not ask the service launcher to activate the prepared update.",
+-              error,
++      const updateId = yield* withUpdateBarrier(
++        Effect.uninterruptible(
++          launcher.requestUpdate({ targetVersion, dbPath: serverConfig.dbPath }).pipe(
++            Effect.mapError((error) =>
++              failWith(
++                error._tag === "ServiceLauncherRejectedError"
++                  ? error.reason
++                  : "Could not ask the service launcher to activate the prepared update.",
++                error,
++              ),
+             ),
++            Effect.tap(() => onHandoffAccepted()),
+           ),
+-          Effect.tap(() => onHandoffAccepted()),
+         ),
+       );
+ 
+@@ -361,9 +391,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
+   return ServerSelfUpdate.of({
+     update,
+     commitDesktopUpdate: (requestId, onHandoffAccepted) =>
+-      requireQuiescentHub.pipe(
+-        Effect.andThen(desktopAppUpdate.commit(requestId, onHandoffAccepted)),
+-      ),
++      withUpdateBarrier(desktopAppUpdate.commit(requestId, onHandoffAccepted)),
+   });
+ });
+ 
+-- 
+2.43.0
+

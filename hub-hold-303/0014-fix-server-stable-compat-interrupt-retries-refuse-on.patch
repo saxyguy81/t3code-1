@@ -1,0 +1,205 @@
+From 83d2e727a674ecd9f23e751f47c33d2f10b5bf98 Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 06:26:19 -0700
+Subject: [PATCH 14/15] fix(server): stable compat interrupt retries, refuse
+ onlyIfSettled, JSONC key check (#303)
+
+Independent review NO-GO on hanan-work#817:
+- a retried compat interrupt (or session.stop) no longer re-resolves the
+  newest run: once any run was interrupted under the command id, the retry
+  interrupts nothing
+- onlyIfSettled session stops are refused (400); their check could only run
+  before admission, where a new turn can slip in
+- the continuation key is detected with the same lenient JSONC parser the
+  settings use, so a commented explicit true is kept
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/orchestration-v2/LegacyDispatch.ts    | 88 ++++++++++---------
+ apps/server/src/serverSettings.test.ts        | 16 ++++
+ apps/server/src/serverSettings.ts             | 21 ++---
+ 3 files changed, 72 insertions(+), 53 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/LegacyDispatch.ts b/apps/server/src/orchestration-v2/LegacyDispatch.ts
+index 6a4af12b7..9cf6242e0 100644
+--- a/apps/server/src/orchestration-v2/LegacyDispatch.ts
++++ b/apps/server/src/orchestration-v2/LegacyDispatch.ts
+@@ -38,6 +38,24 @@ export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(fun
+       ORDER BY ordinal DESC
+     `.pipe(Effect.map((rows) => rows.map((row) => RunId.make(row.run_id))));
+ 
++  // The newest active run changes over time, so a retried interrupt must not
++  // resolve again: once any run was interrupted under this command id, the
++  // command is done and the retry interrupts nothing.
++  const interruptPrefix = `${command.commandId}:interrupt:`;
++  const interruptAlreadyResolved = (threadId: ThreadId) =>
++    sql<{ readonly command_id: string }>`
++      SELECT command_id FROM orchestration_v2_command_receipts
++      WHERE thread_id = ${threadId}
++        AND command_type = 'run.interrupt'
++        AND substr(command_id, 1, ${interruptPrefix.length}) = ${interruptPrefix}
++      LIMIT 1
++    `.pipe(Effect.map((rows) => rows.length > 0));
++  const interruptTargets = (threadId: ThreadId) =>
++    Effect.gen(function* () {
++      if (yield* interruptAlreadyResolved(threadId)) return [];
++      return (yield* activeRunIds(threadId)).slice(0, 1);
++    });
++
+   switch (command.type) {
+     case "thread.turn.start": {
+       if (command.bootstrap !== undefined || command.sourceProposedPlan !== undefined) {
+@@ -90,9 +108,7 @@ export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(fun
+         attachments: command.message.attachments,
+         ...(command.message.context === undefined ? {} : { context: command.message.context }),
+         ...(command.titleSeed === undefined ? {} : { titleSeed: command.titleSeed }),
+-        ...(command.modelSelection === undefined
+-          ? {}
+-          : { modelSelection: command.modelSelection }),
++        ...(command.modelSelection === undefined ? {} : { modelSelection: command.modelSelection }),
+         dispatchMode: { type: "queue_after_active" },
+       });
+       return commands;
+@@ -118,55 +134,41 @@ export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(fun
+       // 0.0.x had one active turn per thread. Interrupt only the newest active
+       // run, and key the command by run so a retry never moves the original
+       // id onto a different run. A 0.0.x turnId has no V2 equivalent.
+-      return (yield* activeRunIds(command.threadId)).slice(0, 1).map(
+-        (runId): OrchestrationV2Command => ({
+-          type: "run.interrupt",
+-          commandId: derived(`interrupt:${runId}`),
+-          threadId: command.threadId,
+-          runId,
+-        }),
+-      );
++      return (yield* interruptTargets(command.threadId)).map((runId): OrchestrationV2Command => ({
++        type: "run.interrupt",
++        commandId: derived(`interrupt:${runId}`),
++        threadId: command.threadId,
++        runId,
++      }));
+     case "thread.session.stop": {
+       // 0.0.x stopped the provider session: the running turn and its process.
+-      const runs = yield* activeRunIds(command.threadId);
++      // 0.0.x decided onlyIfSettled under its serial decider. Here the check
++      // could only run before admission, where a new turn can slip in, so the
++      // conditional stop is refused rather than raced.
+       if (command.onlyIfSettled === true) {
+-        const engaged = yield* sql<{ readonly engaged: number }>`
+-          SELECT
+-            (
+-              -- 0.0.x stopped only threads explicitly settled.
+-              json_extract(payload_json, '$.settledOverride') IS NOT 'settled'
+-            )
+-            OR EXISTS (
+-              SELECT 1 FROM orchestration_v2_projection_runs
+-              WHERE thread_id = ${command.threadId}
+-                AND status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
+-            ) AS engaged
+-          FROM orchestration_v2_projection_threads WHERE thread_id = ${command.threadId}
+-        `;
+-        if (engaged[0]?.engaged !== 0) return [];
++        return yield* new LegacyDispatchUnsupportedError({
++          reason: "onlyIfSettled session stops are not supported",
++        });
+       }
++      const runs = yield* interruptTargets(command.threadId);
+       const sessions = yield* sql<{ readonly provider_session_id: string }>`
+         SELECT provider_session_id FROM orchestration_v2_projection_provider_sessions
+         WHERE thread_id = ${command.threadId} AND status NOT IN ('stopped', 'error')
+       `;
+       return [
+-        ...runs.slice(0, 1).map(
+-          (runId): OrchestrationV2Command => ({
+-            type: "run.interrupt",
+-            commandId: derived(`interrupt:${runId}`),
+-            threadId: command.threadId,
+-            runId,
+-          }),
+-        ),
+-        ...sessions.map(
+-          (session): OrchestrationV2Command => ({
+-            type: "provider-session.detach",
+-            commandId: derived(`detach:${session.provider_session_id}`),
+-            threadId: command.threadId,
+-            providerSessionId: ProviderSessionId.make(session.provider_session_id),
+-            reason: "Session stop requested through the 0.0.x dispatch endpoint.",
+-          }),
+-        ),
++        ...runs.map((runId): OrchestrationV2Command => ({
++          type: "run.interrupt",
++          commandId: derived(`interrupt:${runId}`),
++          threadId: command.threadId,
++          runId,
++        })),
++        ...sessions.map((session): OrchestrationV2Command => ({
++          type: "provider-session.detach",
++          commandId: derived(`detach:${session.provider_session_id}`),
++          threadId: command.threadId,
++          providerSessionId: ProviderSessionId.make(session.provider_session_id),
++          reason: "Session stop requested through the 0.0.x dispatch endpoint.",
++        })),
+       ];
+     }
+     case "thread.archive":
+diff --git a/apps/server/src/serverSettings.test.ts b/apps/server/src/serverSettings.test.ts
+index 3ecc0c78c..f240cdef9 100644
+--- a/apps/server/src/serverSettings.test.ts
++++ b/apps/server/src/serverSettings.test.ts
+@@ -2265,4 +2265,20 @@ it.layer(NodeServices.layer)("server settings", (it) => {
+       assert.isTrue(settings.continueThreadsAfterServerUpdate);
+     }).pipe(Effect.provide(layerServerSettings())),
+   );
++
++  it.effect("keeps an explicit continuation opt-in written as commented JSONC", () =>
++    Effect.gen(function* () {
++      const serverConfig = yield* ServerConfig.ServerConfig;
++      const fileSystem = yield* FileSystem.FileSystem;
++      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
++      yield* insertLegacyThread;
++      const jsonc =
++        '{\n  // resume threads after updates\n  "continueThreadsAfterServerUpdate": true,\n}\n';
++      yield* fileSystem.writeFileString(serverConfig.settingsPath, jsonc);
++
++      const settings = yield* serverSettings.getSettings;
++      assert.isTrue(settings.continueThreadsAfterServerUpdate);
++      assert.equal(yield* fileSystem.readFileString(serverConfig.settingsPath), jsonc);
++    }).pipe(Effect.provide(layerServerSettings())),
++  );
+ });
+diff --git a/apps/server/src/serverSettings.ts b/apps/server/src/serverSettings.ts
+index d10963d9b..437eac187 100644
+--- a/apps/server/src/serverSettings.ts
++++ b/apps/server/src/serverSettings.ts
+@@ -319,17 +319,18 @@ const ServerSettingsJson = fromLenientJson(
+ );
+ const decodeServerSettingsJsonExit = Schema.decodeUnknownExit(ServerSettingsJson);
+ 
++const decodeLenientSettingsObjectExit = Schema.decodeUnknownExit(fromLenientJson(Schema.Unknown));
++
++// Parsed as leniently as the settings themselves, so a commented file's
++// explicit value is seen and kept.
+ function hasStoredContinuationKey(raw: string): boolean {
+-  try {
+-    const parsed: unknown = JSON.parse(raw);
+-    return (
+-      typeof parsed === "object" &&
+-      parsed !== null &&
+-      Object.hasOwn(parsed, "continueThreadsAfterServerUpdate")
+-    );
+-  } catch {
+-    return false;
+-  }
++  const parsed = decodeLenientSettingsObjectExit(raw);
++  return (
++    parsed._tag === "Success" &&
++    typeof parsed.value === "object" &&
++    parsed.value !== null &&
++    Object.hasOwn(parsed.value, "continueThreadsAfterServerUpdate")
++  );
+ }
+ /**
+  * The retired `providers.<kind>` map, read without its old schemas. Before
+-- 
+2.43.0
+

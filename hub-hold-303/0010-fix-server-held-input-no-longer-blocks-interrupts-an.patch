@@ -1,7 +1,7 @@
 From a1c2f334742f56f6b4e070153d9e6f4252f2a520 Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 06:02:34 -0700
-Subject: [PATCH 10/13] fix(server): held input no longer blocks interrupts and
+Subject: [PATCH 10/15] fix(server): held input no longer blocks interrupts and
  approvals on its thread (#303)
 
 Review 1 blocker. While the hub hold is set, a pending holdable effect (steer,
