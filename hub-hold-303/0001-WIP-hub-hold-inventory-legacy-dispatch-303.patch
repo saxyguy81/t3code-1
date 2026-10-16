@@ -1,0 +1,1056 @@
+From 4647eb512d4f6e5a15df3ab01357feda35710989 Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 04:21:59 -0700
+Subject: [PATCH 01/17] WIP hub hold, inventory, legacy dispatch (#303)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/orchestration-v2/EffectOutbox.ts      |  61 ++++++
+ .../src/orchestration-v2/EffectWorker.ts      |  12 ++
+ apps/server/src/orchestration-v2/HubHold.ts   | 189 +++++++++++++++++
+ .../src/orchestration-v2/LegacyDispatch.ts    | 191 ++++++++++++++++++
+ .../src/orchestration-v2/RuntimeIdentity.ts   |  38 ++++
+ apps/server/src/orchestration-v2/http.ts      | 102 ++++++++++
+ .../src/orchestration-v2/runtimeLayer.ts      |   2 +
+ apps/server/src/persistence/Migrations.ts     |   2 +
+ .../Migrations/063_HubDispatchHold.ts         |  27 +++
+ packages/contracts/src/environmentHttp.ts     |  53 +++++
+ packages/contracts/src/hubDispatch.ts         | 161 +++++++++++++++
+ packages/contracts/src/index.ts               |   1 +
+ 12 files changed, 839 insertions(+)
+ create mode 100644 apps/server/src/orchestration-v2/HubHold.ts
+ create mode 100644 apps/server/src/orchestration-v2/LegacyDispatch.ts
+ create mode 100644 apps/server/src/orchestration-v2/RuntimeIdentity.ts
+ create mode 100644 apps/server/src/persistence/Migrations/063_HubDispatchHold.ts
+ create mode 100644 packages/contracts/src/hubDispatch.ts
+
+diff --git a/apps/server/src/orchestration-v2/EffectOutbox.ts b/apps/server/src/orchestration-v2/EffectOutbox.ts
+index c50429f3e..e77f9a875 100644
+--- a/apps/server/src/orchestration-v2/EffectOutbox.ts
++++ b/apps/server/src/orchestration-v2/EffectOutbox.ts
+@@ -132,6 +132,22 @@ export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
+   "delegated-tasks.stop",
+ ] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+ 
++/**
++ * Effects that hand new input to a provider. A hub hold keeps them pending:
++ * every message is still accepted and committed, and nothing reaches a provider
++ * until the hold clears. Interrupts and approval answers are never held, so an
++ * operator can still stop work that was already running.
++ */
++export const HUB_HOLDABLE_EFFECT_TYPES = [
++  "provider-turn.start",
++  "provider-turn.steer",
++  "provider-turn.restart",
++  "provider-runtime.continue",
++] as const satisfies ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
++
++export const isHubHoldableEffectType = (type: string): boolean =>
++  (HUB_HOLDABLE_EFFECT_TYPES as ReadonlyArray<string>).includes(type);
++
+ export const PROCESS_BOUND_EFFECT_TYPES = [
+   "provider-turn.start",
+   "provider-turn.interrupt",
+@@ -236,6 +252,15 @@ export interface EffectOutboxV2Shape {
+     readonly excludeRestartContinuations?: boolean;
+   }) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
+   readonly nextClaimableAt: Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
++  /**
++   * Returns a claimed holdable effect to pending, without counting the attempt,
++   * when a hub hold committed between its claim and its execution. Returns false
++   * when the hold is not set or the worker no longer owns the lease.
++   */
++  readonly releaseHeldClaim: (input: {
++    readonly effectId: string;
++    readonly workerId: string;
++  }) => Effect.Effect<boolean, EffectOutboxError>;
+   readonly succeed: (input: {
+     readonly effectId: string;
+     readonly workerId: string;
+@@ -332,6 +357,12 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
+     // that skips restart continuations is not blocked by them either.
+     // Title generation is correlated metadata work, so it has its own
+     // per-thread lane and cannot delay provider lifecycle effects.
++    // Read inside each claim statement, so a committed hub hold and a claim
++    // serialize in SQLite instead of racing through process memory.
++    const hubHeldRow = sql`
++      SELECT 1 FROM orchestration_v2_hub_hold AS hub_hold
++      WHERE hub_hold.hold_id = 1 AND hub_hold.held = 1
++    `;
+     const claimableCandidatePredicate = (
+       availableBefore?: string,
+       excludeRestartContinuations = false,
+@@ -343,6 +374,10 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
+             : sql`candidate.available_at <= ${availableBefore}`
+         }
+         AND candidate.status = 'pending'
++        AND NOT (
++          candidate.effect_type IN ${sql.in(HUB_HOLDABLE_EFFECT_TYPES)}
++          AND EXISTS (${hubHeldRow})
++        )
+         AND NOT EXISTS (
+           SELECT 1
+           FROM orchestration_v2_effect_outbox AS active
+@@ -607,6 +642,32 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
+             : new EffectOutboxError({ operation: "next-claimable", cause }),
+         ),
+       ),
++      releaseHeldClaim: ({ effectId, workerId }) =>
++        Effect.gen(function* () {
++          const now = DateTime.formatIso(yield* DateTime.now);
++          const rows = yield* sql<{ readonly effect_id: string }>`
++            UPDATE orchestration_v2_effect_outbox
++            SET
++              status = 'pending',
++              attempt_count = MAX(0, attempt_count - 1),
++              lease_owner = NULL,
++              lease_expires_at = NULL,
++              updated_at = ${now},
++              last_error = 'Held by the hub dispatch hold before execution.'
++            WHERE effect_id = ${effectId}
++              AND status = 'running'
++              AND lease_owner = ${workerId}
++              AND effect_type IN ${sql.in(HUB_HOLDABLE_EFFECT_TYPES)}
++              AND EXISTS (${hubHeldRow})
++            RETURNING effect_id
++          `;
++          if (rows.length === 1) cancellationSignals.delete(effectId);
++          return rows.length === 1;
++        }).pipe(
++          Effect.mapError(
++            (cause) => new EffectOutboxError({ operation: "release-held-claim", effectId, cause }),
++          ),
++        ),
+       succeed: ({ effectId, workerId }) =>
+         Effect.gen(function* () {
+           const now = DateTime.formatIso(yield* DateTime.now);
+diff --git a/apps/server/src/orchestration-v2/EffectWorker.ts b/apps/server/src/orchestration-v2/EffectWorker.ts
+index aaf4507ca..c33be1387 100644
+--- a/apps/server/src/orchestration-v2/EffectWorker.ts
++++ b/apps/server/src/orchestration-v2/EffectWorker.ts
+@@ -735,6 +735,18 @@ export const layerWithOptions = (
+             return false;
+           }).pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
+           if (cancelledBeforeExecution) return true;
++          // Turn-start check of the hub hold. A hold that committed after this
++          // claim still wins: the effect goes back to pending, unsent, without
++          // spending an attempt, and runs once the hold clears.
++          if (EffectOutbox.isHubHoldableEffectType(effect.request.type)) {
++            const released = yield* outbox
++              .releaseHeldClaim({ effectId: effect.id, workerId })
++              .pipe(Effect.onError((cause) => requeueClaim(effect, cause)));
++            if (released) {
++              yield* outbox.clearCancellation(effect.id);
++              return true;
++            }
++          }
+ 
+           const execution = executor
+             .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
+diff --git a/apps/server/src/orchestration-v2/HubHold.ts b/apps/server/src/orchestration-v2/HubHold.ts
+new file mode 100644
+index 000000000..1478c6c12
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/HubHold.ts
+@@ -0,0 +1,189 @@
++import type {
++  HubDispatchHoldState,
++  HubDispatchInventory,
++  HubDispatchInventoryCounts,
++  ProjectId,
++} from "@t3tools/contracts";
++import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
++import * as Context from "effect/Context";
++import * as DateTime from "effect/DateTime";
++import * as Effect from "effect/Effect";
++import type * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import type * as Path from "effect/Path";
++import * as Schema from "effect/Schema";
++import * as SqlClient from "effect/sql/SqlClient";
++
++import * as ServerSettings from "../serverSettings.ts";
++import * as EffectOutbox from "./EffectOutbox.ts";
++import { captureRuntimeIdentity } from "./RuntimeIdentity.ts";
++
++export const readHubHeld = (sql: SqlClient.SqlClient) =>
++  sql<{ readonly held: number }>`
++    SELECT held FROM orchestration_v2_hub_hold WHERE hold_id = 1
++  `.pipe(Effect.map((rows) => rows[0]?.held === 1));
++
++export class HubHoldError extends Schema.TaggedError<HubHoldError>()("HubHoldError", {
++  operation: Schema.String,
++  cause: Schema.optional(Schema.Defect()),
++}) {
++  override get message(): string {
++    return `Hub dispatch hold ${this.operation} failed.`;
++  }
++}
++
++export interface HubHoldV2Shape {
++  readonly read: Effect.Effect<HubDispatchHoldState, HubHoldError>;
++  readonly isHeld: Effect.Effect<boolean, HubHoldError>;
++  /** Idempotent: setting an active hold records the request and keeps the hold. */
++  readonly set: (input: {
++    readonly actor: string;
++    readonly reason: string;
++  }) => Effect.Effect<HubDispatchHoldState, HubHoldError>;
++  readonly clear: (input: {
++    readonly actor: string;
++    readonly reason: string;
++  }) => Effect.Effect<HubDispatchHoldState, HubHoldError>;
++  readonly counts: Effect.Effect<HubDispatchInventoryCounts, HubHoldError>;
++  /** Read-only: running bundle identity, hold, counts and continuation readback. */
++  readonly inventory: Effect.Effect<HubDispatchInventory, HubHoldError>;
++}
++
++export class HubHoldV2 extends Context.Service<HubHoldV2, HubHoldV2Shape>()(
++  "t3/orchestration-v2/HubHold/HubHoldV2",
++) {}
++
++type HoldRow = {
++  readonly held: number;
++  readonly actor: string;
++  readonly reason: string;
++  readonly changed_at: string;
++};
++
++const toState = (row: HoldRow | undefined): HubDispatchHoldState =>
++  row === undefined
++    ? { held: false, actor: null, reason: null, changedAt: null }
++    : { held: row.held === 1, actor: row.actor, reason: row.reason, changedAt: row.changed_at };
++
++export const layer: Layer.Layer<
++  HubHoldV2,
++  never,
++  | SqlClient.SqlClient
++  | EffectOutbox.EffectOutboxV2
++  | ServerSettings.ServerSettingsService
++  | FileSystem.FileSystem
++  | Path.Path
++> = Layer.effect(
++    HubHoldV2,
++    Effect.gen(function* () {
++      const sql = yield* SqlClient.SqlClient;
++      const outbox = yield* EffectOutbox.EffectOutboxV2;
++      const settings = yield* ServerSettings.ServerSettingsService;
++      const runtime = yield* captureRuntimeIdentity;
++
++      const readRow = sql<HoldRow>`
++        SELECT held, actor, reason, changed_at FROM orchestration_v2_hub_hold WHERE hold_id = 1
++      `.pipe(Effect.map((rows) => toState(rows[0])));
++
++      const write = (action: "set" | "clear", input: { actor: string; reason: string }) =>
++        sql
++          .withTransaction(
++            Effect.gen(function* () {
++              const now = DateTime.formatIso(yield* DateTime.now);
++              const held = action === "set" ? 1 : 0;
++              yield* sql`
++                INSERT INTO orchestration_v2_hub_hold (hold_id, held, actor, reason, changed_at)
++                VALUES (1, ${held}, ${input.actor}, ${input.reason}, ${now})
++                ON CONFLICT (hold_id) DO UPDATE SET
++                  held = excluded.held,
++                  actor = excluded.actor,
++                  reason = excluded.reason,
++                  changed_at = excluded.changed_at
++              `;
++              yield* sql`
++                INSERT INTO orchestration_v2_hub_hold_history (action, actor, reason, changed_at)
++                VALUES (${action}, ${input.actor}, ${input.reason}, ${now})
++              `;
++              return yield* readRow;
++            }),
++          )
++          .pipe(Effect.mapError((cause) => new HubHoldError({ operation: action, cause })));
++
++      const counts = sql<{
++          readonly queued: number;
++          readonly held: number;
++          readonly in_flight: number;
++          readonly outbox_pending: number;
++          readonly outbox_running: number;
++          readonly held_effects: number;
++        }>`
++          SELECT
++            (SELECT COUNT(*) FROM orchestration_v2_projection_runs
++              WHERE status = 'queued' AND json_extract(payload_json, '$.queueHeld') IS NOT 1)
++              AS queued,
++            (SELECT COUNT(*) FROM orchestration_v2_projection_runs
++              WHERE status = 'queued' AND json_extract(payload_json, '$.queueHeld') IS 1) AS held,
++            (SELECT COUNT(*) FROM orchestration_v2_projection_runs
++              WHERE status IN ('preparing', 'starting', 'running', 'waiting')) AS in_flight,
++            (SELECT COUNT(*) FROM orchestration_v2_effect_outbox WHERE status = 'pending')
++              AS outbox_pending,
++            (SELECT COUNT(*) FROM orchestration_v2_effect_outbox WHERE status = 'running')
++              AS outbox_running,
++            (SELECT COUNT(*) FROM orchestration_v2_effect_outbox
++              WHERE status = 'pending' AND effect_type IN ${sql.in(EffectOutbox.HUB_HOLDABLE_EFFECT_TYPES)})
++              AS held_effects
++        `.pipe(
++          Effect.map((rows) => {
++            const row = rows[0];
++            return {
++              queued: row?.queued ?? 0,
++              held: row?.held ?? 0,
++              inFlight: row?.in_flight ?? 0,
++              outboxPending: row?.outbox_pending ?? 0,
++              outboxRunning: row?.outbox_running ?? 0,
++              heldEffects: row?.held_effects ?? 0,
++            };
++          }),
++          Effect.mapError((cause) => new HubHoldError({ operation: "counts", cause })),
++        );
++
++      const inventory = Effect.gen(function* () {
++        const current = yield* settings.getSettings.pipe(
++          Effect.mapError((cause) => new HubHoldError({ operation: "settings", cause })),
++        );
++        const projectOverridesEnabled = (
++          Object.keys(current.projectSettingsOverrides) as Array<ProjectId>
++        ).filter(
++          (projectId) =>
++            resolveProjectSettings(current, projectId).settings.continueThreadsAfterServerUpdate ===
++            true,
++        );
++        return {
++          runtime,
++          hold: yield* readRow.pipe(
++            Effect.mapError((cause) => new HubHoldError({ operation: "read", cause })),
++          ),
++          counts: yield* counts,
++          continueThreadsAfterServerUpdate: {
++            global: current.continueThreadsAfterServerUpdate,
++            projectOverridesEnabled,
++          },
++          readAt: DateTime.formatIso(yield* DateTime.now),
++        } satisfies HubDispatchInventory;
++      });
++
++      return HubHoldV2.of({
++        inventory,
++        counts,
++        read: readRow.pipe(Effect.mapError((cause) => new HubHoldError({ operation: "read", cause }))),
++        isHeld: readHubHeld(sql).pipe(
++          Effect.mapError((cause) => new HubHoldError({ operation: "read", cause })),
++        ),
++        set: (input) => write("set", input),
++        // Held effects are durable pending rows; waking the workers is all a
++        // clear needs to deliver each of them exactly once.
++        clear: (input) =>
++          write("clear", input).pipe(Effect.tap(() => outbox.notifyAvailable(64))),
++      });
++    }),
++  );
+diff --git a/apps/server/src/orchestration-v2/LegacyDispatch.ts b/apps/server/src/orchestration-v2/LegacyDispatch.ts
+new file mode 100644
+index 000000000..ca281243c
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/LegacyDispatch.ts
+@@ -0,0 +1,191 @@
++import {
++  CommandId,
++  type LegacyDispatchCommand,
++  type OrchestrationV2Command,
++  ProviderSessionId,
++  RunId,
++  type ThreadId,
++} from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as SqlClient from "effect/sql/SqlClient";
++
++/**
++ * Translates a 0.0.x `POST /api/orchestration/dispatch` command into the V2
++ * commands that do the same work. Operator tools keep their request shape;
++ * every translated command takes the normal V2 path, hub hold included.
++ *
++ * Per-turn runtime and interaction modes become thread-level mode commands,
++ * sent only when they differ from the thread's current modes. A command with
++ * nothing left to do translates to no commands.
++ */
++export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(function* (
++  command: LegacyDispatchCommand,
++) {
++  const sql = yield* SqlClient.SqlClient;
++  const derived = (suffix: string) => CommandId.make(`${command.commandId}:${suffix}`);
++
++  const activeRunIds = (threadId: ThreadId) =>
++    sql<{ readonly run_id: string }>`
++      SELECT run_id FROM orchestration_v2_projection_runs
++      WHERE thread_id = ${threadId} AND status IN ('preparing', 'starting', 'running', 'waiting')
++      ORDER BY ordinal DESC
++    `.pipe(Effect.map((rows) => rows.map((row) => RunId.make(row.run_id))));
++
++  switch (command.type) {
++    case "thread.turn.start": {
++      const modes = yield* sql<{
++        readonly runtime_mode: string;
++        readonly interaction_mode: string;
++      }>`
++        SELECT runtime_mode, interaction_mode FROM orchestration_v2_projection_threads
++        WHERE thread_id = ${command.threadId}
++      `;
++      const current = modes[0];
++      const commands: Array<OrchestrationV2Command> = [];
++      if (current !== undefined && current.runtime_mode !== command.runtimeMode) {
++        commands.push({
++          type: "thread.runtime-mode.set",
++          commandId: derived("runtime-mode"),
++          threadId: command.threadId,
++          runtimeMode: command.runtimeMode,
++        });
++      }
++      if (current !== undefined && current.interaction_mode !== command.interactionMode) {
++        commands.push({
++          type: "thread.interaction-mode.set",
++          commandId: derived("interaction-mode"),
++          threadId: command.threadId,
++          interactionMode: command.interactionMode,
++        });
++      }
++      // 0.0.x queued a turn behind the running one; it never steered.
++      commands.push({
++        type: "message.dispatch",
++        createdBy: "user",
++        creationSource: "web",
++        commandId: command.commandId,
++        threadId: command.threadId,
++        messageId: command.message.messageId,
++        text: command.message.text,
++        attachments: command.message.attachments,
++        ...(command.message.context === undefined ? {} : { context: command.message.context }),
++        ...(command.titleSeed === undefined ? {} : { titleSeed: command.titleSeed }),
++        ...(command.modelSelection === undefined
++          ? {}
++          : { modelSelection: command.modelSelection }),
++        dispatchMode: { type: "queue_after_active" },
++      });
++      return commands;
++    }
++    case "thread.create":
++      return [
++        {
++          type: "thread.create",
++          createdBy: "user",
++          creationSource: "web",
++          commandId: command.commandId,
++          threadId: command.threadId,
++          projectId: command.projectId,
++          title: command.title,
++          modelSelection: command.modelSelection,
++          runtimeMode: command.runtimeMode,
++          interactionMode: command.interactionMode,
++          branch: command.branch,
++          worktreePath: command.worktreePath,
++        },
++      ] satisfies Array<OrchestrationV2Command>;
++    case "thread.turn.interrupt":
++      return (yield* activeRunIds(command.threadId)).map(
++        (runId, index): OrchestrationV2Command => ({
++          type: "run.interrupt",
++          commandId: index === 0 ? command.commandId : derived(`interrupt:${runId}`),
++          threadId: command.threadId,
++          runId,
++        }),
++      );
++    case "thread.session.stop": {
++      // 0.0.x stopped the provider session: the running turn and its process.
++      const runs = yield* activeRunIds(command.threadId);
++      if (command.onlyIfSettled === true) {
++        const engaged = yield* sql<{ readonly engaged: number }>`
++          SELECT
++            (
++              json_extract(payload_json, '$.settledAt') IS NULL
++              AND json_extract(payload_json, '$.settledOverride') IS NOT 'settled'
++            )
++            OR EXISTS (
++              SELECT 1 FROM orchestration_v2_projection_runs
++              WHERE thread_id = ${command.threadId}
++                AND status IN ('queued', 'preparing', 'starting', 'running', 'waiting')
++            ) AS engaged
++          FROM orchestration_v2_projection_threads WHERE thread_id = ${command.threadId}
++        `;
++        if (engaged[0]?.engaged !== 0) return [];
++      }
++      const sessions = yield* sql<{ readonly provider_session_id: string }>`
++        SELECT provider_session_id FROM orchestration_v2_projection_provider_sessions
++        WHERE thread_id = ${command.threadId} AND status NOT IN ('stopped', 'error')
++      `;
++      return [
++        ...(runs.length > 0
++          ? [
++              {
++                type: "thread.stop",
++                commandId: command.commandId,
++                threadId: command.threadId,
++                reason: "Session stop requested through the 0.0.x dispatch endpoint.",
++              } satisfies OrchestrationV2Command,
++            ]
++          : []),
++        ...sessions.map(
++          (session, index): OrchestrationV2Command => ({
++            type: "provider-session.detach",
++            commandId:
++              runs.length === 0 && index === 0
++                ? command.commandId
++                : derived(`detach:${session.provider_session_id}`),
++            threadId: command.threadId,
++            providerSessionId: ProviderSessionId.make(session.provider_session_id),
++            reason: "Session stop requested through the 0.0.x dispatch endpoint.",
++          }),
++        ),
++      ];
++    }
++    case "thread.archive":
++    case "thread.unarchive":
++    case "thread.settle":
++      return [
++        { type: command.type, commandId: command.commandId, threadId: command.threadId },
++      ] satisfies Array<OrchestrationV2Command>;
++    case "thread.meta.update": {
++      const commands: Array<OrchestrationV2Command> = [];
++      if (command.modelSelection !== undefined) {
++        commands.push({
++          type: "thread.model-selection.set",
++          commandId: derived("model-selection"),
++          threadId: command.threadId,
++          modelSelection: command.modelSelection,
++        });
++      }
++      if (
++        command.title !== undefined ||
++        command.regenerateTitle !== undefined ||
++        command.branch !== undefined ||
++        command.worktreePath !== undefined
++      ) {
++        commands.push({
++          type: "thread.metadata.update",
++          commandId: command.commandId,
++          threadId: command.threadId,
++          ...(command.title === undefined ? {} : { title: command.title }),
++          ...(command.regenerateTitle === undefined
++            ? {}
++            : { regenerateTitle: command.regenerateTitle }),
++          ...(command.branch === undefined ? {} : { branch: command.branch }),
++          ...(command.worktreePath === undefined ? {} : { worktreePath: command.worktreePath }),
++        });
++      }
++      return commands;
++    }
++  }
++});
+diff --git a/apps/server/src/orchestration-v2/RuntimeIdentity.ts b/apps/server/src/orchestration-v2/RuntimeIdentity.ts
+new file mode 100644
+index 000000000..140a568cd
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/RuntimeIdentity.ts
+@@ -0,0 +1,38 @@
++import type { HubDispatchRuntimeIdentity } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as Hex from "effect/encoding/Hex";
++import * as FileSystem from "effect/FileSystem";
++import * as Path from "effect/Path";
++
++import packageJson from "../../package.json" with { type: "json" };
++
++/**
++ * Identity of the bundle this process loaded, captured once at boot. Hashing
++ * later would report replaced staging files instead of the running bytes.
++ */
++export const captureRuntimeIdentity: Effect.Effect<
++  HubDispatchRuntimeIdentity,
++  never,
++  FileSystem.FileSystem | Path.Path
++> = Effect.gen(function* () {
++  const fs = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const entry = process.argv[1];
++  if (entry === undefined || path.extname(entry) !== ".mjs") {
++    return { version: packageJson.version, entryPath: null, bundleSha256: null };
++  }
++  const entryPath = yield* fs.realPath(entry);
++  const bytes = yield* fs.readFile(entryPath);
++  const digest = yield* Effect.promise(() => crypto.subtle.digest("SHA-256", bytes));
++  return {
++    version: packageJson.version,
++    entryPath,
++    bundleSha256: Hex.encode(new Uint8Array(digest)),
++  };
++}).pipe(
++  Effect.orElseSucceed(() => ({
++    version: packageJson.version,
++    entryPath: null,
++    bundleSha256: null,
++  })),
++);
+diff --git a/apps/server/src/orchestration-v2/http.ts b/apps/server/src/orchestration-v2/http.ts
+index cccec8e91..c70bd5667 100644
+--- a/apps/server/src/orchestration-v2/http.ts
++++ b/apps/server/src/orchestration-v2/http.ts
+@@ -1,9 +1,13 @@
+ import {
++  AuthEnvironmentMaintainScope,
++  AuthOrchestrationOperateScope,
+   AuthOrchestrationReadScope,
++  EnvironmentAuthenticatedPrincipal,
+   EnvironmentHttpApi,
+   type OrchestrationProjectShell,
+ } from "@t3tools/contracts";
+ import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
+ import * as Predicate from "effect/Predicate";
+ import * as Schema from "effect/Schema";
+ import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
+@@ -16,7 +20,10 @@ import {
+   failEnvironmentNotFound,
+   requireEnvironmentScope,
+ } from "../auth/http.ts";
++import * as ServerConfig from "../config.ts";
+ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
++import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
++import * as ServerSettings from "../serverSettings.ts";
+ import { traceLocalHandlerWork } from "../cloud/traceRelayRequest.ts";
+ import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+ import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
+@@ -28,7 +35,11 @@ import {
+   THREAD_HISTORY_PAGE_POLICY,
+   OLDER_THREAD_USER_TURN_LIMIT,
+ } from "./threadHistoryPaging.ts";
++import * as HubHold from "./HubHold.ts";
++import { translateLegacyDispatch } from "./LegacyDispatch.ts";
++import * as ThreadLaunchService from "./ThreadLaunchService.ts";
+ import * as ThreadManagementService from "./ThreadManagementService.ts";
++import * as ThreadMessageIntake from "./ThreadMessageIntake.ts";
+ import * as ProjectStore from "./ProjectStore.ts";
+ import { buildActiveShellSnapshot, loadShellSnapshotParts } from "./ShellStream.ts";
+ import { boundedSnapshotResponseFields } from "./ThreadStream.ts";
+@@ -62,6 +73,20 @@ export const layer = HttpApiBuilder.group(
+     const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
+     const projectStore = yield* ProjectStore.ProjectStoreV2;
+     const projectEnrichment = yield* ProjectEnrichmentService.ProjectEnrichmentService;
++    const hubHold = yield* HubHold.HubHoldV2;
++    const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
++    const intakeContext = yield* Effect.context<
++      | ThreadManagementService.ThreadManagementService
++      | ThreadLaunchService.ThreadLaunchService
++      | FileSystem.FileSystem
++      | ServerConfig.ServerConfig
++      | ServerSettings.ServerSettingsService
++    >();
++
++    const operatorActor = Effect.map(
++      EnvironmentAuthenticatedPrincipal.asEffect(),
++      (principal) => `${principal.subject} (session ${principal.sessionId})`,
++    );
+ 
+     const enrichProjectShells = Effect.fn("http.orchestration.enrichProjectShells")(
+       (projects: ReadonlyArray<OrchestrationProjectShell>) =>
+@@ -156,6 +181,83 @@ export const layer = HttpApiBuilder.group(
+     );
+ 
+     return handlers
++      .handle(
++        "hubHold",
++        Effect.fn("environment.orchestration.hubHold")(function* (args) {
++          yield* annotateEnvironmentRequest(args.endpoint.name);
++          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
++          return yield* hubHold.read.pipe(
++            Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
++          );
++        }),
++      )
++      .handle(
++        "hubHoldSet",
++        Effect.fn("environment.orchestration.hubHoldSet")(function* (args) {
++          yield* annotateEnvironmentRequest(args.endpoint.name);
++          yield* requireEnvironmentScope(AuthEnvironmentMaintainScope);
++          return yield* hubHold
++            .set({ actor: yield* operatorActor, reason: args.payload.reason })
++            .pipe(Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)));
++        }),
++      )
++      .handle(
++        "hubHoldClear",
++        Effect.fn("environment.orchestration.hubHoldClear")(function* (args) {
++          yield* annotateEnvironmentRequest(args.endpoint.name);
++          yield* requireEnvironmentScope(AuthEnvironmentMaintainScope);
++          return yield* hubHold
++            .clear({ actor: yield* operatorActor, reason: args.payload.reason })
++            .pipe(Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)));
++        }),
++      )
++      .handle(
++        "hubInventory",
++        Effect.fn("environment.orchestration.hubInventory")(function* (args) {
++          yield* annotateEnvironmentRequest(args.endpoint.name);
++          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
++          return yield* hubHold.inventory.pipe(
++            Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
++          );
++        }),
++      )
++      .handle(
++        "legacyDispatch",
++        Effect.fn("environment.orchestration.legacyDispatch")(function* (args) {
++          yield* annotateEnvironmentRequest(args.endpoint.name);
++          yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
++          const commands = yield* translateLegacyDispatch(args.payload).pipe(
++            Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
++          );
++          let sequence = yield* applicationEvents.latestApplicationSequence.pipe(
++            Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
++          );
++          // Same path as the V2 socket dispatch, so the hub hold and command
++          // receipts apply unchanged.
++          for (const command of commands) {
++            const result = yield* startup
++              .enqueueCommand(
++                ThreadMessageIntake.dispatchCommand(
++                  ThreadManagementService.withCreationProvenance(command, {
++                    createdBy: "user",
++                    creationSource: "web",
++                  }),
++                ).pipe(Effect.provide(intakeContext)),
++              )
++              .pipe(
++                Effect.catch((cause) =>
++                  Effect.logWarning("Legacy dispatch command was rejected", {
++                    commandId: command.commandId,
++                    commandType: command.type,
++                    cause,
++                  }).pipe(Effect.andThen(failEnvironmentInvalidRequest("invalid_command"))),
++                ),
++              );
++            sequence = result.sequence;
++          }
++          return { sequence };
++        }),
++      )
+       .handle(
+         "shellSnapshot",
+         Effect.fn("environment.orchestration.shellSnapshot")(function* (args) {
+diff --git a/apps/server/src/orchestration-v2/runtimeLayer.ts b/apps/server/src/orchestration-v2/runtimeLayer.ts
+index 18ad606d9..1164ab292 100644
+--- a/apps/server/src/orchestration-v2/runtimeLayer.ts
++++ b/apps/server/src/orchestration-v2/runtimeLayer.ts
+@@ -20,6 +20,7 @@ import * as CommandPolicy from "./CommandPolicy.ts";
+ import * as CommandReceiptStore from "./CommandReceiptStore.ts";
+ import * as ContextHandoffService from "./ContextHandoffService.ts";
+ import * as EffectOutbox from "./EffectOutbox.ts";
++import * as HubHold from "./HubHold.ts";
+ import * as EffectWorker from "./EffectWorker.ts";
+ import * as EventSink from "./EventSink.ts";
+ import * as EventStore from "./EventStore.ts";
+@@ -362,4 +363,5 @@ export const layerProduction = Layer.mergeAll(
+   layerProviderContinuationWorkerProvided,
+   layerAgentSessionImporterProvided,
+   EffectOutbox.layerPruneWorker.pipe(Layer.provide(EffectOutbox.layer)),
++  HubHold.layer.pipe(Layer.provide(EffectOutbox.layer)),
+ ).pipe(Layer.provide(Scheduler.layer), Layer.provideMerge(layerEventInfrastructure));
+diff --git a/apps/server/src/persistence/Migrations.ts b/apps/server/src/persistence/Migrations.ts
+index 1792046ef..a1601d961 100644
+--- a/apps/server/src/persistence/Migrations.ts
++++ b/apps/server/src/persistence/Migrations.ts
+@@ -76,6 +76,7 @@ import Migration0059 from "./Migrations/059_McpAppModelContext.ts";
+ import Migration0060 from "./Migrations/060_ThreadSnapshotWindowIndexes.ts";
+ import Migration0061 from "./Migrations/061_PullRequestReviewGuides.ts";
+ import Migration0062 from "./Migrations/062_ThreadFailureLookupIndex.ts";
++import Migration0063 from "./Migrations/063_HubDispatchHold.ts";
+ 
+ /**
+  * Migration loader with all migrations defined inline.
+@@ -152,6 +153,7 @@ export const migrationEntries = [
+   [60, "ThreadSnapshotWindowIndexes", Migration0060],
+   [61, "PullRequestReviewGuides", Migration0061],
+   [62, "ThreadFailureLookupIndex", Migration0062],
++  [63, "HubDispatchHold", Migration0063],
+ ] as const;
+ 
+ export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
+diff --git a/apps/server/src/persistence/Migrations/063_HubDispatchHold.ts b/apps/server/src/persistence/Migrations/063_HubDispatchHold.ts
+new file mode 100644
+index 000000000..1ab1df2cb
+--- /dev/null
++++ b/apps/server/src/persistence/Migrations/063_HubDispatchHold.ts
+@@ -0,0 +1,27 @@
++import * as Effect from "effect/Effect";
++import * as SqlClient from "effect/sql/SqlClient";
++
++export default Effect.gen(function* () {
++  const sql = yield* SqlClient.SqlClient;
++
++  // One server-wide row. The effect outbox reads it inside each claim, so a
++  // committed hold and a claim cannot interleave.
++  yield* sql`
++    CREATE TABLE IF NOT EXISTS orchestration_v2_hub_hold (
++      hold_id INTEGER PRIMARY KEY CHECK (hold_id = 1),
++      held INTEGER NOT NULL CHECK (held IN (0, 1)),
++      actor TEXT NOT NULL,
++      reason TEXT NOT NULL,
++      changed_at TEXT NOT NULL
++    )
++  `;
++  yield* sql`
++    CREATE TABLE IF NOT EXISTS orchestration_v2_hub_hold_history (
++      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
++      action TEXT NOT NULL CHECK (action IN ('set', 'clear')),
++      actor TEXT NOT NULL,
++      reason TEXT NOT NULL,
++      changed_at TEXT NOT NULL
++    )
++  `;
++});
+diff --git a/packages/contracts/src/environmentHttp.ts b/packages/contracts/src/environmentHttp.ts
+index fc07bb485..52c6da5ed 100644
+--- a/packages/contracts/src/environmentHttp.ts
++++ b/packages/contracts/src/environmentHttp.ts
+@@ -56,6 +56,13 @@ import {
+   OrchestrationV2ThreadHistoryPage,
+   OrchestrationV2ThreadTranscript,
+ } from "./orchestrationV2.ts";
++import {
++  HubDispatchHoldInput,
++  HubDispatchHoldState,
++  HubDispatchInventory,
++  LegacyDispatchCommand,
++  LegacyDispatchResult,
++} from "./hubDispatch.ts";
+ import { Project, ProjectMutation, ProjectSnapshot } from "./project.ts";
+ import {
+   PullRequestDiffInput,
+@@ -611,7 +618,53 @@ const EnvironmentOrchestrationThreadHistoryErrors = [
+   EnvironmentInternalError,
+ ] as const;
+ 
++const EnvironmentHubDispatchErrors = [
++  EnvironmentRequestInvalidError,
++  EnvironmentScopeRequiredError,
++  EnvironmentResourceNotFoundError,
++  EnvironmentInternalError,
++] as const;
++
+ class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
++  .add(
++    HttpApiEndpoint.get("hubHold", "/api/orchestration/hub-hold", {
++      headers: OptionalBearerHeaders,
++      success: HubDispatchHoldState,
++      error: EnvironmentOrchestrationSnapshotErrors,
++    }).middleware(EnvironmentAuthenticatedAuth),
++  )
++  .add(
++    HttpApiEndpoint.post("hubHoldSet", "/api/orchestration/hub-hold/set", {
++      headers: OptionalBearerHeaders,
++      payload: HubDispatchHoldInput,
++      success: HubDispatchHoldState,
++      error: EnvironmentHubDispatchErrors,
++    }).middleware(EnvironmentAuthenticatedAuth),
++  )
++  .add(
++    HttpApiEndpoint.post("hubHoldClear", "/api/orchestration/hub-hold/clear", {
++      headers: OptionalBearerHeaders,
++      payload: HubDispatchHoldInput,
++      success: HubDispatchHoldState,
++      error: EnvironmentHubDispatchErrors,
++    }).middleware(EnvironmentAuthenticatedAuth),
++  )
++  .add(
++    HttpApiEndpoint.get("hubInventory", "/api/orchestration/inventory", {
++      headers: OptionalBearerHeaders,
++      success: HubDispatchInventory,
++      error: EnvironmentOrchestrationSnapshotErrors,
++    }).middleware(EnvironmentAuthenticatedAuth),
++  )
++  /** 0.0.x command dispatch, translated onto the V2 dispatch path for operator tools. */
++  .add(
++    HttpApiEndpoint.post("legacyDispatch", "/api/orchestration/dispatch", {
++      headers: OptionalBearerHeaders,
++      payload: LegacyDispatchCommand,
++      success: LegacyDispatchResult,
++      error: EnvironmentHubDispatchErrors,
++    }).middleware(EnvironmentAuthenticatedAuth),
++  )
+   .add(
+     HttpApiEndpoint.get("shellSnapshot", "/api/orchestration/shell", {
+       headers: OrchestrationProtocolHeaders,
+diff --git a/packages/contracts/src/hubDispatch.ts b/packages/contracts/src/hubDispatch.ts
+new file mode 100644
+index 000000000..4bcf39c27
+--- /dev/null
++++ b/packages/contracts/src/hubDispatch.ts
+@@ -0,0 +1,161 @@
++import * as Effect from "effect/Effect";
++import * as Schema from "effect/Schema";
++
++import {
++  CommandId,
++  IsoDateTime,
++  MessageId,
++  NonNegativeInt,
++  ProjectId,
++  ThreadId,
++  TrimmedNonEmptyString,
++} from "./baseSchemas.ts";
++import { ChatAttachment } from "./chatAttachment.ts";
++import { OrchestrationMessageContext } from "./composerContext.ts";
++import { ModelSelection } from "./modelSelection.ts";
++import {
++  DEFAULT_PROVIDER_INTERACTION_MODE,
++  DEFAULT_RUNTIME_MODE,
++  ProviderInteractionMode,
++  RuntimeMode,
++} from "./providerPolicy.ts";
++
++/**
++ * Hub-wide dispatch hold. While held every message is still accepted and
++ * committed; nothing new reaches a provider until the hold clears.
++ */
++export const HubDispatchHoldState = Schema.Struct({
++  held: Schema.Boolean,
++  actor: Schema.NullOr(Schema.String),
++  reason: Schema.NullOr(Schema.String),
++  changedAt: Schema.NullOr(Schema.String),
++});
++export type HubDispatchHoldState = typeof HubDispatchHoldState.Type;
++
++export const HubDispatchHoldInput = Schema.Struct({
++  reason: TrimmedNonEmptyString,
++});
++export type HubDispatchHoldInput = typeof HubDispatchHoldInput.Type;
++
++export const HubDispatchInventoryCounts = Schema.Struct({
++  /** Queued runs that will start on their own once their thread is free. */
++  queued: NonNegativeInt,
++  /** Queued runs that wait for an explicit queue resume (after a restart, stop or failure). */
++  held: NonNegativeInt,
++  /** Runs that are preparing, starting, running or waiting. */
++  inFlight: NonNegativeInt,
++  outboxPending: NonNegativeInt,
++  outboxRunning: NonNegativeInt,
++  /** Pending effects that hand input to a provider; kept pending while the hub is held. */
++  heldEffects: NonNegativeInt,
++});
++export type HubDispatchInventoryCounts = typeof HubDispatchInventoryCounts.Type;
++
++export const HubDispatchRuntimeIdentity = Schema.Struct({
++  version: Schema.String,
++  entryPath: Schema.NullOr(Schema.String),
++  bundleSha256: Schema.NullOr(Schema.String),
++});
++export type HubDispatchRuntimeIdentity = typeof HubDispatchRuntimeIdentity.Type;
++
++export const HubDispatchInventory = Schema.Struct({
++  runtime: HubDispatchRuntimeIdentity,
++  hold: HubDispatchHoldState,
++  counts: HubDispatchInventoryCounts,
++  continueThreadsAfterServerUpdate: Schema.Struct({
++    global: Schema.Boolean,
++    /** Projects whose override turns continuation on, whatever the global value. */
++    projectOverridesEnabled: Schema.Array(ProjectId),
++  }),
++  readAt: Schema.String,
++});
++export type HubDispatchInventory = typeof HubDispatchInventory.Type;
++
++/**
++ * The 0.0.x `POST /api/orchestration/dispatch` command shapes that operator
++ * tools still send. Each one is translated onto the V2 dispatch path.
++ */
++export const LegacyThreadTurnStartCommand = Schema.Struct({
++  type: Schema.Literal("thread.turn.start"),
++  commandId: CommandId,
++  threadId: ThreadId,
++  message: Schema.Struct({
++    messageId: MessageId,
++    role: Schema.Literal("user"),
++    text: Schema.String,
++    attachments: Schema.Array(ChatAttachment),
++    context: Schema.optional(OrchestrationMessageContext),
++  }),
++  modelSelection: Schema.optional(ModelSelection),
++  titleSeed: Schema.optional(TrimmedNonEmptyString),
++  runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
++  interactionMode: ProviderInteractionMode.pipe(
++    Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
++  ),
++  createdAt: IsoDateTime,
++});
++export type LegacyThreadTurnStartCommand = typeof LegacyThreadTurnStartCommand.Type;
++
++export const LegacyDispatchCommand = Schema.Union([
++  LegacyThreadTurnStartCommand,
++  Schema.Struct({
++    type: Schema.Literal("thread.create"),
++    commandId: CommandId,
++    threadId: ThreadId,
++    projectId: ProjectId,
++    title: TrimmedNonEmptyString,
++    modelSelection: ModelSelection,
++    runtimeMode: RuntimeMode,
++    interactionMode: ProviderInteractionMode.pipe(
++      Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
++    ),
++    branch: Schema.NullOr(TrimmedNonEmptyString),
++    worktreePath: Schema.NullOr(TrimmedNonEmptyString),
++    createdAt: IsoDateTime,
++  }),
++  Schema.Struct({
++    type: Schema.Literal("thread.turn.interrupt"),
++    commandId: CommandId,
++    threadId: ThreadId,
++    turnId: Schema.optional(TrimmedNonEmptyString),
++    createdAt: IsoDateTime,
++  }),
++  Schema.Struct({
++    type: Schema.Literal("thread.session.stop"),
++    commandId: CommandId,
++    threadId: ThreadId,
++    createdAt: IsoDateTime,
++    onlyIfSettled: Schema.optional(Schema.Boolean),
++  }),
++  Schema.Struct({
++    type: Schema.Literal("thread.archive"),
++    commandId: CommandId,
++    threadId: ThreadId,
++  }),
++  Schema.Struct({
++    type: Schema.Literal("thread.unarchive"),
++    commandId: CommandId,
++    threadId: ThreadId,
++  }),
++  Schema.Struct({
++    type: Schema.Literal("thread.settle"),
++    commandId: CommandId,
++    threadId: ThreadId,
++  }),
++  Schema.Struct({
++    type: Schema.Literal("thread.meta.update"),
++    commandId: CommandId,
++    threadId: ThreadId,
++    title: Schema.optional(TrimmedNonEmptyString),
++    regenerateTitle: Schema.optional(Schema.Literal(true)),
++    modelSelection: Schema.optional(ModelSelection),
++    branch: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
++    worktreePath: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
++  }),
++]);
++export type LegacyDispatchCommand = typeof LegacyDispatchCommand.Type;
++
++export const LegacyDispatchResult = Schema.Struct({
++  sequence: NonNegativeInt,
++});
++export type LegacyDispatchResult = typeof LegacyDispatchResult.Type;
+diff --git a/packages/contracts/src/index.ts b/packages/contracts/src/index.ts
+index 600d503ad..104737f83 100644
+--- a/packages/contracts/src/index.ts
++++ b/packages/contracts/src/index.ts
+@@ -37,6 +37,7 @@ export * from "./pullRequestReviewGuide.ts";
+ export * from "./orchestrationDispatch.ts";
+ export * from "./orchestrationProject.ts";
+ export * from "./orchestrationV2.ts";
++export * from "./hubDispatch.ts";
+ export * from "./applicationEvent.ts";
+ export * from "./orchestratorMcp.ts";
+ export * from "./threadMetadataMcp.ts";
+-- 
+2.43.0
+

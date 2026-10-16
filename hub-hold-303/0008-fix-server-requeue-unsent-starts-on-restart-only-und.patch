@@ -1,0 +1,318 @@
+From 7da456c065adbe96a3f984f31ae21db2571c085d Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 05:18:21 -0700
+Subject: [PATCH 08/17] fix(server): requeue unsent starts on restart only
+ under the hub hold (#303)
+
+Without a hold, restart keeps upstream's meaning and cancels in-flight runs,
+so upstream queue-order behaviour is unchanged. Recovery mocks answer the new
+outbox read; migration manifest tests include 063.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/server/src/orchestration-v2/EffectOutbox.ts | 10 ++++++----
+ apps/server/src/orchestration-v2/HubHold.test.ts | 16 +++++++++++-----
+ ...iderRuntimeRecoveryService.regression.test.ts |  1 +
+ .../ProviderRuntimeRecoveryService.test.ts       | 16 ++++++++++++++++
+ .../ProviderRuntimeRecoveryService.ts            |  9 +++++----
+ .../Migrations/055_OrchestrationV2.test.ts       |  4 +++-
+ .../reconcileV2PreviewMigration.test.ts          |  2 ++
+ 7 files changed, 44 insertions(+), 14 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/EffectOutbox.ts b/apps/server/src/orchestration-v2/EffectOutbox.ts
+index 97f05346b..46a65e377 100644
+--- a/apps/server/src/orchestration-v2/EffectOutbox.ts
++++ b/apps/server/src/orchestration-v2/EffectOutbox.ts
+@@ -253,10 +253,11 @@ export interface EffectOutboxV2Shape {
+   }) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
+   readonly nextClaimableAt: Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
+   /**
+-   * True when the run's turn start was enqueued but never claimed: no attempt
+-   * was made, so the provider provably never received the turn.
++   * True while the hub hold is set and the run's turn start was enqueued but
++   * never claimed: no attempt was made, so the provider provably never
++   * received the turn.
+    */
+-  readonly hasUnsentTurnStart: (runId: RunId) => Effect.Effect<boolean, EffectOutboxError>;
++  readonly hasHubHeldTurnStart: (runId: RunId) => Effect.Effect<boolean, EffectOutboxError>;
+   /**
+    * Returns a claimed holdable effect to pending, without counting the attempt,
+    * when a hub hold committed between its claim and its execution. Returns false
+@@ -647,13 +648,14 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
+             : new EffectOutboxError({ operation: "next-claimable", cause }),
+         ),
+       ),
+-      hasUnsentTurnStart: (runId) =>
++      hasHubHeldTurnStart: (runId) =>
+         sql<{ readonly effect_id: string }>`
+           SELECT effect_id FROM orchestration_v2_effect_outbox
+           WHERE effect_type = 'provider-turn.start'
+             AND status = 'pending'
+             AND attempt_count = 0
+             AND json_extract(payload_json, '$.runId') = ${runId}
++            AND EXISTS (${hubHeldRow})
+           LIMIT 1
+         `.pipe(
+           Effect.map((rows) => rows.length > 0),
+diff --git a/apps/server/src/orchestration-v2/HubHold.test.ts b/apps/server/src/orchestration-v2/HubHold.test.ts
+index 70a246490..91ead101b 100644
+--- a/apps/server/src/orchestration-v2/HubHold.test.ts
++++ b/apps/server/src/orchestration-v2/HubHold.test.ts
+@@ -92,18 +92,24 @@ it.effect("returns a claim that raced the hold to pending without spending an at
+     const row = Option.getOrThrow(yield* outbox.get(effectId));
+     assert.equal(row.status, "pending");
+     assert.equal(row.attemptCount, 0);
+-    assert.isTrue(yield* outbox.hasUnsentTurnStart(RunId.make("run:hub-hold:race")));
++    assert.isTrue(yield* outbox.hasHubHeldTurnStart(RunId.make("run:hub-hold:race")));
+   }).pipe(Effect.provide(layerTest())),
+ );
+ 
+-it.effect("reports a start as unsent only before its first claim", () =>
++it.effect("reports a start as held and unsent only under the hold and before its first claim", () =>
+   Effect.gen(function* () {
++    const hold = yield* HubHold.HubHoldV2;
+     const outbox = yield* EffectOutbox.EffectOutboxV2;
+     const runId = RunId.make("run:hub-hold:unsent");
+     yield* enqueueStart("unsent");
+-    assert.isTrue(yield* outbox.hasUnsentTurnStart(runId));
++    // Without a hold, restart keeps its upstream meaning for unclaimed starts.
++    assert.isFalse(yield* outbox.hasHubHeldTurnStart(runId));
++    yield* hold.set(operator);
++    assert.isTrue(yield* outbox.hasHubHeldTurnStart(runId));
++    yield* hold.clear(operator);
+     yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 });
+-    assert.isFalse(yield* outbox.hasUnsentTurnStart(runId));
++    yield* hold.set(operator);
++    assert.isFalse(yield* outbox.hasHubHeldTurnStart(runId));
+     // A start that failed once may have reached the provider.
+     yield* outbox.retry({
+       effectId: "effect:hub-hold:unsent",
+@@ -111,7 +117,7 @@ it.effect("reports a start as unsent only before its first claim", () =>
+       error: "boom",
+       delayMs: 0,
+     });
+-    assert.isFalse(yield* outbox.hasUnsentTurnStart(runId));
++    assert.isFalse(yield* outbox.hasHubHeldTurnStart(runId));
+   }).pipe(Effect.provide(layerTest())),
+ );
+ 
+diff --git a/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.regression.test.ts b/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.regression.test.ts
+index 126746648..f77d17ad9 100644
+--- a/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.regression.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.regression.test.ts
+@@ -65,6 +65,7 @@ it("uses the thread provider for stale background work without provider threads"
+           runRecoveryOnce: Effect.succeed(false),
+         }),
+         Layer.mock(EffectOutbox.EffectOutboxV2)({
++          hasHubHeldTurnStart: () => Effect.succeed(false),
+           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+         }),
+       ),
+diff --git a/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts b/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts
+index d6f8672ca..b148c070b 100644
+--- a/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts
++++ b/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.test.ts
+@@ -44,6 +44,7 @@ it.effect("leaves durable effects for the worker after runtime reconciliation",
+             ),
+           }),
+           Layer.mock(EffectOutbox.EffectOutboxV2)({
++            hasHubHeldTurnStart: () => Effect.succeed(false),
+             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+           }),
+         ),
+@@ -106,6 +107,7 @@ it.effect("reads recovery projections only for threads that need runtime recover
+           runRecoveryOnce: Effect.succeed(false),
+         }),
+         Layer.mock(EffectOutbox.EffectOutboxV2)({
++          hasHubHeldTurnStart: () => Effect.succeed(false),
+           cancelUnsettled: () => Effect.succeed([]),
+           signalCancellations: () => Effect.void,
+           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+@@ -162,6 +164,7 @@ it.effect("expires orphaned runtime requests before command readiness", () => {
+           runRecoveryOnce: Effect.succeed(false),
+         }),
+         Layer.mock(EffectOutbox.EffectOutboxV2)({
++          hasHubHeldTurnStart: () => Effect.succeed(false),
+           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+         }),
+       ),
+@@ -214,6 +217,7 @@ it.effect("preserves async questions across startup and shutdown", () => {
+           runRecoveryOnce: Effect.succeed(false),
+         }),
+         Layer.mock(EffectOutbox.EffectOutboxV2)({
++          hasHubHeldTurnStart: () => Effect.succeed(false),
+           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+           cancelUnsettled: () => Effect.succeed([]),
+           signalCancellations: () => Effect.void,
+@@ -267,6 +271,7 @@ it.effect("uses the same reconciliation path to cancel runtime requests during s
+           runRecoveryOnce: Effect.succeed(false),
+         }),
+         Layer.mock(EffectOutbox.EffectOutboxV2)({
++          hasHubHeldTurnStart: () => Effect.succeed(false),
+           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+         }),
+       ),
+@@ -353,6 +358,7 @@ it.effect(
+             runRecoveryOnce: Effect.succeed(false),
+           }),
+           Layer.mock(EffectOutbox.EffectOutboxV2)({
++            hasHubHeldTurnStart: () => Effect.succeed(false),
+             listByCommandId: () =>
+               Effect.succeed([
+                 {
+@@ -496,6 +502,7 @@ it.effect(
+             runRecoveryOnce: Effect.succeed(false),
+           }),
+           Layer.mock(EffectOutbox.EffectOutboxV2)({
++            hasHubHeldTurnStart: () => Effect.succeed(false),
+             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+           }),
+         ),
+@@ -562,6 +569,7 @@ it.effect("cancels a stale waiting run when no checkpoint capture can finish it"
+           runRecoveryOnce: Effect.succeed(false),
+         }),
+         Layer.mock(EffectOutbox.EffectOutboxV2)({
++          hasHubHeldTurnStart: () => Effect.succeed(false),
+           listByCommandId: () => Effect.succeed([]),
+           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+         }),
+@@ -627,6 +635,7 @@ it.effect("closes a secret request card's form when its run is recovered", () =>
+           runRecoveryOnce: Effect.succeed(false),
+         }),
+         Layer.mock(EffectOutbox.EffectOutboxV2)({
++          hasHubHeldTurnStart: () => Effect.succeed(false),
+           listByCommandId: () => Effect.succeed([]),
+           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+         }),
+@@ -712,6 +721,7 @@ it.effect.each(["queued", "preparing"] as const)("recovers $0 work after restart
+           runRecoveryOnce: Effect.succeed(false),
+         }),
+         Layer.mock(EffectOutbox.EffectOutboxV2)({
++          hasHubHeldTurnStart: () => Effect.succeed(false),
+           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+         }),
+       ),
+@@ -837,6 +847,7 @@ it.effect(
+             runRecoveryOnce: Effect.succeed(false),
+           }),
+           Layer.mock(EffectOutbox.EffectOutboxV2)({
++            hasHubHeldTurnStart: () => Effect.succeed(false),
+             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+           }),
+         ),
+@@ -945,6 +956,7 @@ it.effect("cancels workflow members and child roots without run ids after restar
+           runRecoveryOnce: Effect.succeed(false),
+         }),
+         Layer.mock(EffectOutbox.EffectOutboxV2)({
++          hasHubHeldTurnStart: () => Effect.succeed(false),
+           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+         }),
+       ),
+@@ -1113,6 +1125,7 @@ it.effect(
+             runRecoveryOnce: Effect.succeed(false),
+           }),
+           Layer.mock(EffectOutbox.EffectOutboxV2)({
++            hasHubHeldTurnStart: () => Effect.succeed(false),
+             listByCommandId: () => Effect.succeed([]),
+             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+           }),
+@@ -1270,6 +1283,7 @@ it.effect(
+             runRecoveryOnce: Effect.succeed(false),
+           }),
+           Layer.mock(EffectOutbox.EffectOutboxV2)({
++            hasHubHeldTurnStart: () => Effect.succeed(false),
+             listByCommandId: () => Effect.succeed([]),
+             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+           }),
+@@ -1402,6 +1416,7 @@ it.effect(
+             runRecoveryOnce: Effect.succeed(false),
+           }),
+           Layer.mock(EffectOutbox.EffectOutboxV2)({
++            hasHubHeldTurnStart: () => Effect.succeed(false),
+             listByCommandId: () => Effect.succeed([]),
+             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+           }),
+@@ -1563,6 +1578,7 @@ it.effect("leaves delegated tasks to their own child threads after process loss"
+           runRecoveryOnce: Effect.succeed(false),
+         }),
+         Layer.mock(EffectOutbox.EffectOutboxV2)({
++          hasHubHeldTurnStart: () => Effect.succeed(false),
+           listByCommandId: () => Effect.succeed([]),
+           reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+         }),
+diff --git a/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts b/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts
+index e91a38fdc..68336b498 100644
+--- a/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts
++++ b/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts
+@@ -195,14 +195,15 @@ export const make = Effect.gen(function* () {
+     ) {
+       const now = yield* DateTime.now;
+       const runs = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
+-      // A start that was accepted but never claimed (a hub hold, or a crash
+-      // before the worker reached it) provably never reached the provider. It
+-      // goes back to the front of the queue, held, instead of being cancelled.
++      // Under the hub hold, a start that was accepted but never claimed provably
++      // never reached the provider. It goes back to the front of the queue,
++      // held, instead of being cancelled. Without a hold, restart keeps
++      // cancelling in-flight runs.
+       const unsentRuns = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
+       for (const run of nonterminalRuns(projection)) {
+         if (
+           run.status === "starting" &&
+-          (yield* outbox.hasUnsentTurnStart(run.id).pipe(
++          (yield* outbox.hasHubHeldTurnStart(run.id).pipe(
+             Effect.mapError(
+               (cause) =>
+                 new ProviderRuntimeRecoveryError({
+diff --git a/apps/server/src/persistence/Migrations/055_OrchestrationV2.test.ts b/apps/server/src/persistence/Migrations/055_OrchestrationV2.test.ts
+index 237e8daf3..199ca99be 100644
+--- a/apps/server/src/persistence/Migrations/055_OrchestrationV2.test.ts
++++ b/apps/server/src/persistence/Migrations/055_OrchestrationV2.test.ts
+@@ -13,7 +13,7 @@ layer("055_OrchestrationV2", (it) => {
+     Effect.sync(() => {
+       assert.deepStrictEqual(
+         migrationEntries.map(([id]) => id),
+-        Array.from({ length: 62 }, (_, index) => index + 1),
++        Array.from({ length: 63 }, (_, index) => index + 1),
+       );
+     }),
+   );
+@@ -34,6 +34,7 @@ layer("055_OrchestrationV2", (it) => {
+         [60, "ThreadSnapshotWindowIndexes"],
+         [61, "PullRequestReviewGuides"],
+         [62, "ThreadFailureLookupIndex"],
++        [63, "HubDispatchHold"],
+       ]);
+       assert.deepStrictEqual(yield* runMigrations(), []);
+ 
+@@ -62,6 +63,7 @@ layer("055_OrchestrationV2", (it) => {
+         { migration_id: 60, name: "ThreadSnapshotWindowIndexes" },
+         { migration_id: 61, name: "PullRequestReviewGuides" },
+         { migration_id: 62, name: "ThreadFailureLookupIndex" },
++        { migration_id: 63, name: "HubDispatchHold" },
+       ]);
+ 
+       const tables = yield* sql<{ readonly name: string }>`
+diff --git a/apps/server/src/persistence/reconcileV2PreviewMigration.test.ts b/apps/server/src/persistence/reconcileV2PreviewMigration.test.ts
+index 684520bce..e9b426fcd 100644
+--- a/apps/server/src/persistence/reconcileV2PreviewMigration.test.ts
++++ b/apps/server/src/persistence/reconcileV2PreviewMigration.test.ts
+@@ -43,6 +43,7 @@ describe("V2 preview upgrade", () => {
+         [60, "ThreadSnapshotWindowIndexes"],
+         [61, "PullRequestReviewGuides"],
+         [62, "ThreadFailureLookupIndex"],
++        [63, "HubDispatchHold"],
+       ]);
+       assert.deepStrictEqual(yield* runMigrations(), []);
+       assert.deepStrictEqual(yield* sql`SELECT * FROM orchestration_v2_legacy_imports`, imports);
+@@ -128,6 +129,7 @@ describe("V2 preview upgrade", () => {
+         [60, "ThreadSnapshotWindowIndexes"],
+         [61, "PullRequestReviewGuides"],
+         [62, "ThreadFailureLookupIndex"],
++        [63, "HubDispatchHold"],
+       ]);
+     }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: ":memory:" }))),
+   );
+-- 
+2.43.0
+

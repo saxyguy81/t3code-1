@@ -1,0 +1,40 @@
+From 4e5af593892c25b32e1e48a8261bcef8cdd19d71 Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 05:08:33 -0700
+Subject: [PATCH 03/17] docs(server): attach releaseHeldClaim doc to its member
+ (#303)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/server/src/orchestration-v2/EffectOutbox.ts | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/EffectOutbox.ts b/apps/server/src/orchestration-v2/EffectOutbox.ts
+index b091dff9d..97f05346b 100644
+--- a/apps/server/src/orchestration-v2/EffectOutbox.ts
++++ b/apps/server/src/orchestration-v2/EffectOutbox.ts
+@@ -252,16 +252,16 @@ export interface EffectOutboxV2Shape {
+     readonly excludeRestartContinuations?: boolean;
+   }) => Effect.Effect<Option.Option<OrchestrationEffectV2>, EffectOutboxError>;
+   readonly nextClaimableAt: Effect.Effect<Option.Option<DateTime.Utc>, EffectOutboxError>;
+-  /**
+-   * Returns a claimed holdable effect to pending, without counting the attempt,
+-   * when a hub hold committed between its claim and its execution. Returns false
+-   * when the hold is not set or the worker no longer owns the lease.
+-   */
+   /**
+    * True when the run's turn start was enqueued but never claimed: no attempt
+    * was made, so the provider provably never received the turn.
+    */
+   readonly hasUnsentTurnStart: (runId: RunId) => Effect.Effect<boolean, EffectOutboxError>;
++  /**
++   * Returns a claimed holdable effect to pending, without counting the attempt,
++   * when a hub hold committed between its claim and its execution. Returns false
++   * when the hold is not set or the worker no longer owns the lease.
++   */
+   readonly releaseHeldClaim: (input: {
+     readonly effectId: string;
+     readonly workerId: string;
+-- 
+2.43.0
+

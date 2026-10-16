@@ -1,0 +1,44 @@
+From 26f000046d81d460d183ef504ac12e12c835f628 Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 05:12:30 -0700
+Subject: [PATCH 06/17] fix(server): legacy dispatch translator gets SqlClient
+ from the layer, not the request (#303)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/server/src/orchestration-v2/http.ts | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/apps/server/src/orchestration-v2/http.ts b/apps/server/src/orchestration-v2/http.ts
+index fdff28481..fea5e7bff 100644
+--- a/apps/server/src/orchestration-v2/http.ts
++++ b/apps/server/src/orchestration-v2/http.ts
+@@ -10,8 +10,8 @@ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+ import * as Predicate from "effect/Predicate";
+ import * as Schema from "effect/Schema";
+-import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
+ import * as SqlClient from "effect/sql/SqlClient";
++import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
+ 
+ import {
+   annotateEnvironmentRequest,
+@@ -81,6 +81,7 @@ export const layer = HttpApiBuilder.group(
+       | FileSystem.FileSystem
+       | ServerConfig.ServerConfig
+       | ServerSettings.ServerSettingsService
++      | SqlClient.SqlClient
+     >();
+ 
+     const operatorActor = Effect.gen(function* () {
+@@ -227,6 +228,7 @@ export const layer = HttpApiBuilder.group(
+           yield* annotateEnvironmentRequest(args.endpoint.name);
+           yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
+           const commands = yield* translateLegacyDispatch(args.payload).pipe(
++            Effect.provide(intakeContext),
+             Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
+           );
+           let sequence = yield* applicationEvents.latestApplicationSequence.pipe(
+-- 
+2.43.0
+

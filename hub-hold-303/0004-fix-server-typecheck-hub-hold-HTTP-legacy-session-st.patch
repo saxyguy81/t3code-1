@@ -1,0 +1,162 @@
+From eba37f233afc04e53b51df45adb653116e8caa8f Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 05:10:21 -0700
+Subject: [PATCH 04/17] fix(server): typecheck hub hold HTTP, legacy session
+ stop, settings op (#303)
+
+- read the operator principal by yielding the service
+- 0.0.x session stop interrupts active runs (thread.stop is server-only)
+- add read-legacy-threads to ServerSettingsOperation
+- Orchestrator layer type now requires SqlClient
+- HTTP tests mock the new hold and dispatch services
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/orchestration-v2/LegacyDispatch.ts     | 18 ++++++++----------
+ .../src/orchestration-v2/Orchestrator.ts       |  1 +
+ .../boundedSnapshotTransport.test.ts           | 15 +++++++++++++++
+ apps/server/src/orchestration-v2/http.test.ts  | 14 ++++++++++++++
+ apps/server/src/orchestration-v2/http.ts       |  8 ++++----
+ packages/contracts/src/settings.ts             |  1 +
+ 6 files changed, 43 insertions(+), 14 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/LegacyDispatch.ts b/apps/server/src/orchestration-v2/LegacyDispatch.ts
+index ca281243c..01edb3539 100644
+--- a/apps/server/src/orchestration-v2/LegacyDispatch.ts
++++ b/apps/server/src/orchestration-v2/LegacyDispatch.ts
+@@ -127,16 +127,14 @@ export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(fun
+         WHERE thread_id = ${command.threadId} AND status NOT IN ('stopped', 'error')
+       `;
+       return [
+-        ...(runs.length > 0
+-          ? [
+-              {
+-                type: "thread.stop",
+-                commandId: command.commandId,
+-                threadId: command.threadId,
+-                reason: "Session stop requested through the 0.0.x dispatch endpoint.",
+-              } satisfies OrchestrationV2Command,
+-            ]
+-          : []),
++        ...runs.map(
++          (runId, index): OrchestrationV2Command => ({
++            type: "run.interrupt",
++            commandId: index === 0 ? command.commandId : derived(`interrupt:${runId}`),
++            threadId: command.threadId,
++            runId,
++          }),
++        ),
+         ...sessions.map(
+           (session, index): OrchestrationV2Command => ({
+             type: "provider-session.detach",
+diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
+index edb3983e5..8f318fb5f 100644
+--- a/apps/server/src/orchestration-v2/Orchestrator.ts
++++ b/apps/server/src/orchestration-v2/Orchestrator.ts
+@@ -11668,6 +11668,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+ export const layer: Layer.Layer<
+   OrchestratorV2,
+   never,
++  | SqlClient.SqlClient
+   | CheckpointServiceV2
+   | FileSystem.FileSystem
+   | Path.Path
+diff --git a/apps/server/src/orchestration-v2/boundedSnapshotTransport.test.ts b/apps/server/src/orchestration-v2/boundedSnapshotTransport.test.ts
+index 46c99b95f..6619f7381 100644
+--- a/apps/server/src/orchestration-v2/boundedSnapshotTransport.test.ts
++++ b/apps/server/src/orchestration-v2/boundedSnapshotTransport.test.ts
+@@ -39,6 +39,11 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+ import * as SqlitePersistence from "../persistence/Sqlite.ts";
+ import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+ import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
++import * as ServerConfig from "../config.ts";
++import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
++import * as HubHold from "./HubHold.ts";
++import * as ThreadLaunchService from "./ThreadLaunchService.ts";
++import * as ServerSettings from "../serverSettings.ts";
+ import { subscribeOrchestrationV2Thread } from "../ws.ts";
+ import * as OrchestrationHttp from "./http.ts";
+ import * as ProjectionStore from "./ProjectionStore.ts";
+@@ -244,6 +249,16 @@ const withHttp = <A>(use: (get: (path: string) => Promise<Response>) => Promise<
+       Layer.provide(OrchestrationHttp.layer),
+       Layer.provide(auth),
+       Layer.provide(Layer.succeedContext(context)),
++      // Hub hold and 0.0.x dispatch services; these routes never reach them.
++      Layer.provide(
++        Layer.mergeAll(
++          Layer.mock(HubHold.HubHoldV2)({}),
++          Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({}),
++          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
++          Layer.mock(ServerConfig.ServerConfig)({}),
++          Layer.mock(ServerSettings.ServerSettingsService)({}),
++        ),
++      ),
+       Layer.provide(NodeHttpPlatform.layer),
+       Layer.provide(Etag.layerWeak),
+       Layer.provide(NodeServices.layer),
+diff --git a/apps/server/src/orchestration-v2/http.test.ts b/apps/server/src/orchestration-v2/http.test.ts
+index 74476d658..2a3f52f64 100644
+--- a/apps/server/src/orchestration-v2/http.test.ts
++++ b/apps/server/src/orchestration-v2/http.test.ts
+@@ -30,6 +30,10 @@ import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
+ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+ import * as SqlitePersistence from "../persistence/Sqlite.ts";
+ import * as ServerSettings from "../serverSettings.ts";
++import * as ServerConfig from "../config.ts";
++import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
++import * as HubHold from "./HubHold.ts";
++import * as ThreadLaunchService from "./ThreadLaunchService.ts";
+ 
+ import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+ import { ProjectEnrichmentService } from "../project/ProjectEnrichmentService.ts";
+@@ -151,6 +155,16 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
+       ),
+       Layer.provide(Layer.succeedContext(services)),
+       Layer.provide(Layer.mock(ProjectEnrichmentService)({})),
++      // Hub hold and 0.0.x dispatch services; these routes never reach them.
++      Layer.provide(
++        Layer.mergeAll(
++          Layer.mock(HubHold.HubHoldV2)({}),
++          Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({}),
++          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
++          Layer.mock(ServerConfig.ServerConfig)({}),
++          Layer.mock(ServerSettings.ServerSettingsService)({}),
++        ),
++      ),
+       Layer.provide(HttpPlatform.layer),
+       Layer.provide(Etag.layerWeak),
+       Layer.provide(NodeServices.layer),
+diff --git a/apps/server/src/orchestration-v2/http.ts b/apps/server/src/orchestration-v2/http.ts
+index c70bd5667..fdff28481 100644
+--- a/apps/server/src/orchestration-v2/http.ts
++++ b/apps/server/src/orchestration-v2/http.ts
+@@ -83,10 +83,10 @@ export const layer = HttpApiBuilder.group(
+       | ServerSettings.ServerSettingsService
+     >();
+ 
+-    const operatorActor = Effect.map(
+-      EnvironmentAuthenticatedPrincipal.asEffect(),
+-      (principal) => `${principal.subject} (session ${principal.sessionId})`,
+-    );
++    const operatorActor = Effect.gen(function* () {
++      const principal = yield* EnvironmentAuthenticatedPrincipal;
++      return `${principal.subject} (session ${principal.sessionId})`;
++    });
+ 
+     const enrichProjectShells = Effect.fn("http.orchestration.enrichProjectShells")(
+       (projects: ReadonlyArray<OrchestrationProjectShell>) =>
+diff --git a/packages/contracts/src/settings.ts b/packages/contracts/src/settings.ts
+index 569fcf40c..b1ac7553b 100644
+--- a/packages/contracts/src/settings.ts
++++ b/packages/contracts/src/settings.ts
+@@ -1457,6 +1457,7 @@ export const ServerSettingsOperation = Schema.Literals([
+   "create-provider-instance",
+   "read-file",
+   "read-provider-history",
++  "read-legacy-threads",
+   "read-project-settings",
+   "read-secret",
+   "remove-secret",
+-- 
+2.43.0
+

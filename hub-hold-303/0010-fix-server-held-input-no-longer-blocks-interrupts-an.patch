@@ -1,0 +1,55 @@
+From a1c2f334742f56f6b4e070153d9e6f4252f2a520 Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 06:02:34 -0700
+Subject: [PATCH 10/17] fix(server): held input no longer blocks interrupts and
+ approvals on its thread (#303)
+
+Review 1 blocker. While the hub hold is set, a pending holdable effect (steer,
+restart, start, continue) no longer blocks later non-holdable effects on the
+same thread, so Stop, approval answers and checkpoints proceed. Under the
+hold, promote-to-steer is accepted and leaves the message queued.
+WIP: regression test still to add.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/server/src/orchestration-v2/EffectOutbox.ts | 7 +++++++
+ apps/server/src/orchestration-v2/Orchestrator.ts | 5 +++++
+ 2 files changed, 12 insertions(+)
+
+diff --git a/apps/server/src/orchestration-v2/EffectOutbox.ts b/apps/server/src/orchestration-v2/EffectOutbox.ts
+index 46a65e377..382319d05 100644
+--- a/apps/server/src/orchestration-v2/EffectOutbox.ts
++++ b/apps/server/src/orchestration-v2/EffectOutbox.ts
+@@ -398,6 +398,13 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
+                     ? sql`active.effect_type != 'provider-runtime.continue'`
+                     : sql`1 = 1`
+                 }
++                -- Input the hub hold keeps back must not stall the interrupts,
++                -- approval answers and checkpoints queued behind it.
++                AND NOT (
++                  active.effect_type IN ${sql.in(HUB_HOLDABLE_EFFECT_TYPES)}
++                  AND candidate.effect_type NOT IN ${sql.in(HUB_HOLDABLE_EFFECT_TYPES)}
++                  AND EXISTS (${hubHeldRow})
++                )
+               )
+             )
+             AND (
+diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
+index 8f318fb5f..55f0a48c7 100644
+--- a/apps/server/src/orchestration-v2/Orchestrator.ts
++++ b/apps/server/src/orchestration-v2/Orchestrator.ts
+@@ -7700,6 +7700,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+           cause: "Automatic completion deliveries cannot be promoted to Steer.",
+         });
+       }
++      // Under the hub hold a steer would hand the active provider new input.
++      // Accept the command and leave the message queued behind the active run.
++      if (yield* readHubHeld(sql).pipe(Effect.orElseSucceed(() => true))) {
++        return;
++      }
+ 
+       const now = yield* DateTime.now;
+       const emitEvent = emit(events, command);
+-- 
+2.43.0
+

@@ -1,0 +1,227 @@
+From 1017b8d9a6a5b68ff473bc28478031729deddcf1 Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 06:07:12 -0700
+Subject: [PATCH 11/17] fix(server): compat dispatch retries are idempotent and
+ match 0.0.45 scope (#303)
+
+Review 1 items 4-7:
+- interrupt and session.stop interrupt only the newest active run, with
+  command ids keyed by run, so a retry never moves the original id onto a
+  different run; detach ids are keyed by session
+- onlyIfSettled requires settledOverride 'settled', as the 0.0.45 decider did
+- client-caused rejections are 400, anything else 500 (retryable); the
+  authenticated actor is logged
+- bootstrap / sourceProposedPlan turn starts are refused with 400 instead
+  of being silently dropped; absent runtime/interaction modes leave the
+  thread's modes alone
+WIP: LegacyDispatch tests to update.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/orchestration-v2/LegacyDispatch.ts    | 50 +++++++++++++------
+ apps/server/src/orchestration-v2/http.ts      | 24 ++++++++-
+ packages/contracts/src/hubDispatch.ts         | 12 +++--
+ 3 files changed, 64 insertions(+), 22 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/LegacyDispatch.ts b/apps/server/src/orchestration-v2/LegacyDispatch.ts
+index 01edb3539..6a4af12b7 100644
+--- a/apps/server/src/orchestration-v2/LegacyDispatch.ts
++++ b/apps/server/src/orchestration-v2/LegacyDispatch.ts
+@@ -7,8 +7,15 @@ import {
+   type ThreadId,
+ } from "@t3tools/contracts";
+ import * as Effect from "effect/Effect";
++import * as Schema from "effect/Schema";
+ import * as SqlClient from "effect/sql/SqlClient";
+ 
++/** A 0.0.x command field whose behaviour the V2 path cannot reproduce. */
++export class LegacyDispatchUnsupportedError extends Schema.TaggedError<LegacyDispatchUnsupportedError>()(
++  "LegacyDispatchUnsupportedError",
++  { reason: Schema.String },
++) {}
++
+ /**
+  * Translates a 0.0.x `POST /api/orchestration/dispatch` command into the V2
+  * commands that do the same work. Operator tools keep their request shape;
+@@ -33,6 +40,11 @@ export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(fun
+ 
+   switch (command.type) {
+     case "thread.turn.start": {
++      if (command.bootstrap !== undefined || command.sourceProposedPlan !== undefined) {
++        return yield* new LegacyDispatchUnsupportedError({
++          reason: "bootstrap and sourceProposedPlan turn starts are not supported",
++        });
++      }
+       const modes = yield* sql<{
+         readonly runtime_mode: string;
+         readonly interaction_mode: string;
+@@ -42,7 +54,11 @@ export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(fun
+       `;
+       const current = modes[0];
+       const commands: Array<OrchestrationV2Command> = [];
+-      if (current !== undefined && current.runtime_mode !== command.runtimeMode) {
++      if (
++        current !== undefined &&
++        command.runtimeMode !== undefined &&
++        current.runtime_mode !== command.runtimeMode
++      ) {
+         commands.push({
+           type: "thread.runtime-mode.set",
+           commandId: derived("runtime-mode"),
+@@ -50,7 +66,11 @@ export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(fun
+           runtimeMode: command.runtimeMode,
+         });
+       }
+-      if (current !== undefined && current.interaction_mode !== command.interactionMode) {
++      if (
++        current !== undefined &&
++        command.interactionMode !== undefined &&
++        current.interaction_mode !== command.interactionMode
++      ) {
+         commands.push({
+           type: "thread.interaction-mode.set",
+           commandId: derived("interaction-mode"),
+@@ -95,10 +115,13 @@ export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(fun
+         },
+       ] satisfies Array<OrchestrationV2Command>;
+     case "thread.turn.interrupt":
+-      return (yield* activeRunIds(command.threadId)).map(
+-        (runId, index): OrchestrationV2Command => ({
++      // 0.0.x had one active turn per thread. Interrupt only the newest active
++      // run, and key the command by run so a retry never moves the original
++      // id onto a different run. A 0.0.x turnId has no V2 equivalent.
++      return (yield* activeRunIds(command.threadId)).slice(0, 1).map(
++        (runId): OrchestrationV2Command => ({
+           type: "run.interrupt",
+-          commandId: index === 0 ? command.commandId : derived(`interrupt:${runId}`),
++          commandId: derived(`interrupt:${runId}`),
+           threadId: command.threadId,
+           runId,
+         }),
+@@ -110,8 +133,8 @@ export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(fun
+         const engaged = yield* sql<{ readonly engaged: number }>`
+           SELECT
+             (
+-              json_extract(payload_json, '$.settledAt') IS NULL
+-              AND json_extract(payload_json, '$.settledOverride') IS NOT 'settled'
++              -- 0.0.x stopped only threads explicitly settled.
++              json_extract(payload_json, '$.settledOverride') IS NOT 'settled'
+             )
+             OR EXISTS (
+               SELECT 1 FROM orchestration_v2_projection_runs
+@@ -127,21 +150,18 @@ export const translateLegacyDispatch = Effect.fn("LegacyDispatch.translate")(fun
+         WHERE thread_id = ${command.threadId} AND status NOT IN ('stopped', 'error')
+       `;
+       return [
+-        ...runs.map(
+-          (runId, index): OrchestrationV2Command => ({
++        ...runs.slice(0, 1).map(
++          (runId): OrchestrationV2Command => ({
+             type: "run.interrupt",
+-            commandId: index === 0 ? command.commandId : derived(`interrupt:${runId}`),
++            commandId: derived(`interrupt:${runId}`),
+             threadId: command.threadId,
+             runId,
+           }),
+         ),
+         ...sessions.map(
+-          (session, index): OrchestrationV2Command => ({
++          (session): OrchestrationV2Command => ({
+             type: "provider-session.detach",
+-            commandId:
+-              runs.length === 0 && index === 0
+-                ? command.commandId
+-                : derived(`detach:${session.provider_session_id}`),
++            commandId: derived(`detach:${session.provider_session_id}`),
+             threadId: command.threadId,
+             providerSessionId: ProviderSessionId.make(session.provider_session_id),
+             reason: "Session stop requested through the 0.0.x dispatch endpoint.",
+diff --git a/apps/server/src/orchestration-v2/http.ts b/apps/server/src/orchestration-v2/http.ts
+index fea5e7bff..f803a9171 100644
+--- a/apps/server/src/orchestration-v2/http.ts
++++ b/apps/server/src/orchestration-v2/http.ts
+@@ -37,6 +37,7 @@ import {
+ } from "./threadHistoryPaging.ts";
+ import * as HubHold from "./HubHold.ts";
+ import { translateLegacyDispatch } from "./LegacyDispatch.ts";
++import { userFacingDispatchErrorMessage } from "./UserFacingErrors.ts";
+ import * as ThreadLaunchService from "./ThreadLaunchService.ts";
+ import * as ThreadManagementService from "./ThreadManagementService.ts";
+ import * as ThreadMessageIntake from "./ThreadMessageIntake.ts";
+@@ -227,9 +228,18 @@ export const layer = HttpApiBuilder.group(
+         Effect.fn("environment.orchestration.legacyDispatch")(function* (args) {
+           yield* annotateEnvironmentRequest(args.endpoint.name);
+           yield* requireEnvironmentScope(AuthOrchestrationOperateScope);
++          const actor = yield* operatorActor;
+           const commands = yield* translateLegacyDispatch(args.payload).pipe(
+             Effect.provide(intakeContext),
+-            Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
++            Effect.catch((cause) =>
++              cause._tag === "LegacyDispatchUnsupportedError"
++                ? Effect.logWarning("Legacy dispatch command is not supported", {
++                    commandId: args.payload.commandId,
++                    actor,
++                    reason: cause.reason,
++                  }).pipe(Effect.andThen(failEnvironmentInvalidRequest("invalid_command")))
++                : failEnvironmentInternal("internal_error", cause),
++            ),
+           );
+           let sequence = yield* applicationEvents.latestApplicationSequence.pipe(
+             Effect.catch((cause) => failEnvironmentInternal("internal_error", cause)),
+@@ -247,12 +257,22 @@ export const layer = HttpApiBuilder.group(
+                 ).pipe(Effect.provide(intakeContext)),
+               )
+               .pipe(
++                // Rejections the socket path reports to users are the client's
++                // fault; anything else is ours, so a client may retry it. Every
++                // translated command id is stable, so a retry is idempotent.
+                 Effect.catch((cause) =>
+                   Effect.logWarning("Legacy dispatch command was rejected", {
+                     commandId: command.commandId,
+                     commandType: command.type,
++                    actor,
+                     cause,
+-                  }).pipe(Effect.andThen(failEnvironmentInvalidRequest("invalid_command"))),
++                  }).pipe(
++                    Effect.andThen(
++                      userFacingDispatchErrorMessage(cause) === undefined
++                        ? failEnvironmentInternal("internal_error", cause)
++                        : failEnvironmentInvalidRequest("invalid_command"),
++                    ),
++                  ),
+                 ),
+               );
+             sequence = result.sequence;
+diff --git a/packages/contracts/src/hubDispatch.ts b/packages/contracts/src/hubDispatch.ts
+index 4bcf39c27..96b42e496 100644
+--- a/packages/contracts/src/hubDispatch.ts
++++ b/packages/contracts/src/hubDispatch.ts
+@@ -15,7 +15,6 @@ import { OrchestrationMessageContext } from "./composerContext.ts";
+ import { ModelSelection } from "./modelSelection.ts";
+ import {
+   DEFAULT_PROVIDER_INTERACTION_MODE,
+-  DEFAULT_RUNTIME_MODE,
+   ProviderInteractionMode,
+   RuntimeMode,
+ } from "./providerPolicy.ts";
+@@ -88,10 +87,13 @@ export const LegacyThreadTurnStartCommand = Schema.Struct({
+   }),
+   modelSelection: Schema.optional(ModelSelection),
+   titleSeed: Schema.optional(TrimmedNonEmptyString),
+-  runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
+-  interactionMode: ProviderInteractionMode.pipe(
+-    Schema.withDecodingDefault(Effect.succeed(DEFAULT_PROVIDER_INTERACTION_MODE)),
+-  ),
++  // Absent modes leave the thread's modes alone rather than resetting them.
++  runtimeMode: Schema.optional(RuntimeMode),
++  interactionMode: Schema.optional(ProviderInteractionMode),
++  // Decoded only so they can be refused: dropping them would silently change
++  // what the turn does.
++  bootstrap: Schema.optional(Schema.Unknown),
++  sourceProposedPlan: Schema.optional(Schema.Unknown),
+   createdAt: IsoDateTime,
+ });
+ export type LegacyThreadTurnStartCommand = typeof LegacyThreadTurnStartCommand.Type;
+-- 
+2.43.0
+

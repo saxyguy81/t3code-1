@@ -1,0 +1,512 @@
+From f03aa07afca078adc8bd702819beb017715a2e00 Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 04:56:50 -0700
+Subject: [PATCH 02/17] WIP hub hold: effect gating, recovery hold, settings
+ import default, selfUpdate guard (#303)
+
+Uncommitted work recovered from predecessor session fa30ad43.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/server/src/cloud/selfUpdate.ts           |  28 ++-
+ .../src/orchestration-v2/EffectOutbox.ts      |  17 ++
+ .../src/orchestration-v2/HubHold.test.ts      | 169 ++++++++++++++++++
+ .../src/orchestration-v2/Orchestrator.ts      |  12 ++
+ .../ProviderRuntimeRecoveryService.ts         |  60 ++++++-
+ apps/server/src/serverSettings.ts             |  41 ++++-
+ 6 files changed, 323 insertions(+), 4 deletions(-)
+ create mode 100644 apps/server/src/orchestration-v2/HubHold.test.ts
+
+diff --git a/apps/server/src/cloud/selfUpdate.ts b/apps/server/src/cloud/selfUpdate.ts
+index 615351c43..c2037adb7 100644
+--- a/apps/server/src/cloud/selfUpdate.ts
++++ b/apps/server/src/cloud/selfUpdate.ts
+@@ -23,6 +23,7 @@ import { HttpClient } from "effect/http";
+ import { CLI_RELEASE_BASE_URL_ENV } from "@t3tools/shared/cliRelease";
+ 
+ import * as ServerConfig from "../config.ts";
++import * as HubHold from "../orchestration-v2/HubHold.ts";
+ import * as DesktopAppUpdate from "../desktopUpdate/DesktopAppUpdate.ts";
+ import * as ProcessRunner from "../processRunner.ts";
+ import {
+@@ -185,6 +186,27 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
+     yield* Config.String(CLI_RELEASE_BASE_URL_ENV).pipe(Config.option),
+   );
+   const inFlight = yield* Ref.make(false);
++  const hubHold = yield* Effect.serviceOption(HubHold.HubHoldV2);
++  // 0.1.0 has no setting that turns self-update off, so every update path
++  // fails closed unless the dispatch inventory is readable and shows no
++  // provider work that a restart would cut: nothing queued to start, in
++  // flight, claimed, or waiting on the hub hold.
++  const requireQuiescentHub = Effect.gen(function* () {
++    if (Option.isNone(hubHold)) {
++      return yield* failWith("Server updates are blocked: the dispatch inventory is unavailable.");
++    }
++    const inventory = yield* hubHold.value.inventory.pipe(
++      Effect.mapError((cause) =>
++        failWith("Server updates are blocked: the dispatch inventory could not be read.", cause),
++      ),
++    );
++    const { queued, inFlight: running, outboxRunning, heldEffects } = inventory.counts;
++    if (queued + running + outboxRunning + heldEffects > 0) {
++      return yield* failWith(
++        `Server updates are blocked while provider work is pending (queued ${queued}, in flight ${running}, claimed ${outboxRunning}, held ${heldEffects}).`,
++      );
++    }
++  });
+ 
+   const capability: ServerSelfUpdateCapability | null =
+     serverConfig.mode === "desktop" ? "desktop-managed" : launcher.managed ? "boot-service" : null;
+@@ -201,6 +223,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
+       // update feed decides what it downloads, and the result carries what
+       // it actually got.
+       if (desktopAppUpdate.available) {
++        yield* requireQuiescentHub;
+         return yield* desktopAppUpdate.run(reportProgress);
+       }
+       return yield* failWith(
+@@ -310,6 +333,7 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
+         ),
+       );
+ 
++      yield* requireQuiescentHub;
+       yield* reportProgress("installing");
+       const updateId = yield* Effect.uninterruptible(
+         launcher.requestUpdate({ targetVersion, dbPath: serverConfig.dbPath }).pipe(
+@@ -337,7 +361,9 @@ export const make = Effect.fn("cloud.server_self_update.make")(function* () {
+   return ServerSelfUpdate.of({
+     update,
+     commitDesktopUpdate: (requestId, onHandoffAccepted) =>
+-      desktopAppUpdate.commit(requestId, onHandoffAccepted),
++      requireQuiescentHub.pipe(
++        Effect.andThen(desktopAppUpdate.commit(requestId, onHandoffAccepted)),
++      ),
+   });
+ });
+ 
+diff --git a/apps/server/src/orchestration-v2/EffectOutbox.ts b/apps/server/src/orchestration-v2/EffectOutbox.ts
+index e77f9a875..b091dff9d 100644
+--- a/apps/server/src/orchestration-v2/EffectOutbox.ts
++++ b/apps/server/src/orchestration-v2/EffectOutbox.ts
+@@ -257,6 +257,11 @@ export interface EffectOutboxV2Shape {
+    * when a hub hold committed between its claim and its execution. Returns false
+    * when the hold is not set or the worker no longer owns the lease.
+    */
++  /**
++   * True when the run's turn start was enqueued but never claimed: no attempt
++   * was made, so the provider provably never received the turn.
++   */
++  readonly hasUnsentTurnStart: (runId: RunId) => Effect.Effect<boolean, EffectOutboxError>;
+   readonly releaseHeldClaim: (input: {
+     readonly effectId: string;
+     readonly workerId: string;
+@@ -642,6 +647,18 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
+             : new EffectOutboxError({ operation: "next-claimable", cause }),
+         ),
+       ),
++      hasUnsentTurnStart: (runId) =>
++        sql<{ readonly effect_id: string }>`
++          SELECT effect_id FROM orchestration_v2_effect_outbox
++          WHERE effect_type = 'provider-turn.start'
++            AND status = 'pending'
++            AND attempt_count = 0
++            AND json_extract(payload_json, '$.runId') = ${runId}
++          LIMIT 1
++        `.pipe(
++          Effect.map((rows) => rows.length > 0),
++          Effect.mapError((cause) => new EffectOutboxError({ operation: "read-unsent", cause })),
++        ),
+       releaseHeldClaim: ({ effectId, workerId }) =>
+         Effect.gen(function* () {
+           const now = DateTime.formatIso(yield* DateTime.now);
+diff --git a/apps/server/src/orchestration-v2/HubHold.test.ts b/apps/server/src/orchestration-v2/HubHold.test.ts
+new file mode 100644
+index 000000000..70a246490
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/HubHold.test.ts
+@@ -0,0 +1,169 @@
++import * as NodeServices from "@effect/platform-node/NodeServices";
++import { assert, it } from "@effect/vitest";
++import { CommandId, RunId, ThreadId } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as Option from "effect/Option";
++import * as SqlClient from "effect/sql/SqlClient";
++
++import * as SqlitePersistence from "../persistence/Sqlite.ts";
++import * as ServerSettings from "../serverSettings.ts";
++import * as EffectOutbox from "./EffectOutbox.ts";
++import * as HubHold from "./HubHold.ts";
++
++const layerTest = (settings: Parameters<typeof ServerSettings.layerTest>[0] = {}) =>
++  Layer.fresh(
++    HubHold.layer.pipe(
++      Layer.provideMerge(EffectOutbox.layer),
++      Layer.provideMerge(SqlitePersistence.layerMemory),
++      Layer.provide(ServerSettings.layerTest(settings)),
++      Layer.provide(NodeServices.layer),
++    ),
++  );
++
++const threadId = ThreadId.make("thread:hub-hold");
++const operator = { actor: "operator (session test)", reason: "maintenance window" };
++
++const enqueueStart = (suffix: string) =>
++  Effect.gen(function* () {
++    const outbox = yield* EffectOutbox.EffectOutboxV2;
++    const effectId = `effect:hub-hold:${suffix}`;
++    yield* outbox.enqueue([
++      {
++        id: effectId,
++        commandId: CommandId.make(`command:hub-hold:${suffix}`),
++        threadId: ThreadId.make(`${threadId}:${suffix}`),
++        request: { type: "provider-turn.start", runId: RunId.make(`run:hub-hold:${suffix}`) },
++      },
++    ]);
++    return effectId;
++  });
++
++it.effect("keeps held provider effects pending and releases each once on clear", () =>
++  Effect.gen(function* () {
++    const hold = yield* HubHold.HubHoldV2;
++    const outbox = yield* EffectOutbox.EffectOutboxV2;
++    yield* hold.set(operator);
++    const effectId = yield* enqueueStart("held");
++    yield* outbox.enqueue([
++      {
++        id: "effect:hub-hold:cleanup",
++        commandId: CommandId.make("command:hub-hold:cleanup"),
++        threadId: ThreadId.make("thread:hub-hold:cleanup"),
++        request: { type: "terminal.cleanup" },
++      },
++    ]);
++
++    // Work that does not reach a provider still runs under the hold.
++    const cleanup = yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 });
++    assert.equal(Option.getOrThrow(cleanup).request.type, "terminal.cleanup");
++    yield* outbox.succeed({ effectId: "effect:hub-hold:cleanup", workerId: "w" });
++    assert.isTrue(
++      Option.isNone(yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 })),
++    );
++    // A held row must not make the worker spin on a past deadline.
++    assert.isTrue(Option.isNone(yield* outbox.nextClaimableAt));
++    assert.deepEqual((yield* hold.counts).heldEffects, 1);
++
++    yield* hold.clear({ ...operator, reason: "window over" });
++    const claimed = yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 });
++    assert.equal(Option.getOrThrow(claimed).id, effectId);
++    assert.equal(Option.getOrThrow(claimed).attemptCount, 1);
++    yield* outbox.succeed({ effectId, workerId: "w" });
++    assert.isTrue(
++      Option.isNone(yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 })),
++    );
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("returns a claim that raced the hold to pending without spending an attempt", () =>
++  Effect.gen(function* () {
++    const hold = yield* HubHold.HubHoldV2;
++    const outbox = yield* EffectOutbox.EffectOutboxV2;
++    const effectId = yield* enqueueStart("race");
++    const claimed = yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 });
++    assert.isTrue(Option.isSome(claimed));
++    // Without a hold the claim is kept.
++    assert.isFalse(yield* outbox.releaseHeldClaim({ effectId, workerId: "w" }));
++
++    yield* hold.set(operator);
++    assert.isFalse(yield* outbox.releaseHeldClaim({ effectId, workerId: "other" }));
++    assert.isTrue(yield* outbox.releaseHeldClaim({ effectId, workerId: "w" }));
++    const row = Option.getOrThrow(yield* outbox.get(effectId));
++    assert.equal(row.status, "pending");
++    assert.equal(row.attemptCount, 0);
++    assert.isTrue(yield* outbox.hasUnsentTurnStart(RunId.make("run:hub-hold:race")));
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("reports a start as unsent only before its first claim", () =>
++  Effect.gen(function* () {
++    const outbox = yield* EffectOutbox.EffectOutboxV2;
++    const runId = RunId.make("run:hub-hold:unsent");
++    yield* enqueueStart("unsent");
++    assert.isTrue(yield* outbox.hasUnsentTurnStart(runId));
++    yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 });
++    assert.isFalse(yield* outbox.hasUnsentTurnStart(runId));
++    // A start that failed once may have reached the provider.
++    yield* outbox.retry({
++      effectId: "effect:hub-hold:unsent",
++      workerId: "w",
++      error: "boom",
++      delayMs: 0,
++    });
++    assert.isFalse(yield* outbox.hasUnsentTurnStart(runId));
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("records who, when and why for every set and clear, and survives a reread", () =>
++  Effect.gen(function* () {
++    const hold = yield* HubHold.HubHoldV2;
++    const sql = yield* SqlClient.SqlClient;
++    assert.deepEqual(yield* hold.read, {
++      held: false,
++      actor: null,
++      reason: null,
++      changedAt: null,
++    });
++    const set = yield* hold.set(operator);
++    assert.isTrue(set.held);
++    assert.equal(set.actor, operator.actor);
++    assert.equal(set.reason, operator.reason);
++    assert.isString(set.changedAt);
++    // Setting again keeps the hold and records the request.
++    yield* hold.set({ ...operator, reason: "still held" });
++    assert.isTrue(yield* hold.isHeld);
++    const cleared = yield* hold.clear({ actor: "other (session b)", reason: "done" });
++    assert.isFalse(cleared.held);
++    assert.equal(cleared.actor, "other (session b)");
++    const history = yield* sql<{ readonly action: string; readonly reason: string }>`
++      SELECT action, reason FROM orchestration_v2_hub_hold_history ORDER BY sequence
++    `;
++    assert.deepEqual(
++      history.map((row) => [row.action, row.reason]),
++      [
++        ["set", "maintenance window"],
++        ["set", "still held"],
++        ["clear", "done"],
++      ],
++    );
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("reads back continuation settings and runtime identity in the inventory", () =>
++  Effect.gen(function* () {
++    const hold = yield* HubHold.HubHoldV2;
++    const inventory = yield* hold.inventory;
++    assert.isFalse(inventory.continueThreadsAfterServerUpdate.global);
++    assert.deepEqual(inventory.continueThreadsAfterServerUpdate.projectOverridesEnabled, []);
++    assert.isString(inventory.runtime.version);
++    assert.deepEqual(inventory.counts, {
++      queued: 0,
++      held: 0,
++      inFlight: 0,
++      outboxPending: 0,
++      outboxRunning: 0,
++      heldEffects: 0,
++    });
++  }).pipe(Effect.provide(layerTest({ continueThreadsAfterServerUpdate: false }))),
++);
+diff --git a/apps/server/src/orchestration-v2/Orchestrator.ts b/apps/server/src/orchestration-v2/Orchestrator.ts
+index a0e1c1fc7..edb3983e5 100644
+--- a/apps/server/src/orchestration-v2/Orchestrator.ts
++++ b/apps/server/src/orchestration-v2/Orchestrator.ts
+@@ -77,6 +77,7 @@ import * as Option from "effect/Option";
+ import * as Ref from "effect/Ref";
+ import * as Schema from "effect/Schema";
+ import * as Stream from "effect/Stream";
++import * as SqlClient from "effect/sql/SqlClient";
+ 
+ import * as ProjectStore from "./ProjectStore.ts";
+ import {
+@@ -85,6 +86,7 @@ import {
+ } from "./CheckpointRestoreSafety.ts";
+ import { CheckpointServiceV2 } from "./CheckpointService.ts";
+ import { CommandPolicyV2, resolveMessageDispatchIntent } from "./CommandPolicy.ts";
++import { readHubHeld } from "./HubHold.ts";
+ import { CommandReceiptStoreV2 } from "./CommandReceiptStore.ts";
+ import { ContextHandoffServiceV2 } from "./ContextHandoffService.ts";
+ import { notificationTurnItem } from "@t3tools/provider-core/server/notification";
+@@ -824,6 +826,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+   const idAllocator = yield* IdAllocator.IdAllocatorV2;
+   const projects = yield* ProjectStore.ProjectStoreV2;
+   const projectionStore = yield* ProjectionStoreV2;
++  const sql = yield* SqlClient.SqlClient;
+   const effectOutbox = yield* EffectOutbox.EffectOutboxV2;
+   const nextTurnItemOrdinal = (
+     projection: Pick<OrchestrationV2ThreadProjection, "thread"> &
+@@ -4864,6 +4867,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
+           }
+         }
+       }
++      // Dispatch check of the hub hold: steering or restarting would hand the
++      // active provider new input now. Queue behind the active run instead, so
++      // the message is accepted, kept durable, and sent once the hold clears.
++      if (
++        (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active") &&
++        (yield* readHubHeld(sql).pipe(Effect.orElseSucceed(() => true)))
++      ) {
++        dispatchMode = { type: "queue_after_active" };
++      }
+       const dispatchText =
+         delegatedCompletion === undefined
+           ? command.text
+diff --git a/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts b/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts
+index d40e517f7..e91a38fdc 100644
+--- a/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts
++++ b/apps/server/src/orchestration-v2/ProviderRuntimeRecoveryService.ts
+@@ -195,7 +195,27 @@ export const make = Effect.gen(function* () {
+     ) {
+       const now = yield* DateTime.now;
+       const runs = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
++      // A start that was accepted but never claimed (a hub hold, or a crash
++      // before the worker reached it) provably never reached the provider. It
++      // goes back to the front of the queue, held, instead of being cancelled.
++      const unsentRuns = [] as Array<OrchestrationV2ThreadProjection["runs"][number]>;
+       for (const run of nonterminalRuns(projection)) {
++        if (
++          run.status === "starting" &&
++          (yield* outbox.hasUnsentTurnStart(run.id).pipe(
++            Effect.mapError(
++              (cause) =>
++                new ProviderRuntimeRecoveryError({
++                  operation: "reconcile",
++                  threadId: projection.thread.id,
++                  cause,
++                }),
++            ),
++          ))
++        ) {
++          unsentRuns.push(run);
++          continue;
++        }
+         if (run.status === "waiting") {
+           const checkpointEffects = yield* outbox
+             .listByCommandId(CommandId.make(`command:effect:checkpoint.capture:${run.id}`))
+@@ -307,6 +327,37 @@ export const make = Effect.gen(function* () {
+       const bufferedMessageIds = new Set(
+         queuedMessages.filter(isBufferedProviderNotification).map((message) => message.id),
+       );
++      // Unsent starts were accepted before anything still queued, so they go
++      // first; the rest keep their relative order behind them.
++      const renumbered = new Map<string, number>();
++      if (unsentRuns.length > 0) {
++        [
++          ...unsentRuns.toSorted((left, right) => left.ordinal - right.ordinal),
++          ...queuedRuns
++            .filter((run) => !bufferedMessageIds.has(run.userMessageId))
++            .toSorted(
++              (left, right) =>
++                (left.queuePosition ?? left.ordinal) - (right.queuePosition ?? right.ordinal) ||
++                left.ordinal - right.ordinal,
++            ),
++        ].forEach((run, index) => renumbered.set(run.id, index + 1));
++      }
++      for (const run of unsentRuns) {
++        events.push({
++          id: yield* allocateEventId(),
++          type: "run.updated",
++          threadId: projection.thread.id,
++          runId: run.id,
++          providerInstanceId: run.providerInstanceId,
++          occurredAt: now,
++          payload: {
++            ...run,
++            status: "queued",
++            queueHeld: true,
++            queuePosition: renumbered.get(run.id) ?? null,
++          },
++        });
++      }
+       // Buffered wakes lost their output with the process. Durable queued messages
+       // keep their execution identities and order until the user resumes them.
+       for (const run of queuedRuns) {
+@@ -314,7 +365,8 @@ export const make = Effect.gen(function* () {
+           runs.push(run);
+           continue;
+         }
+-        if (run.queueHeld === true) continue;
++        const queuePosition = renumbered.get(run.id);
++        if (run.queueHeld === true && queuePosition === undefined) continue;
+         events.push({
+           id: yield* allocateEventId(),
+           type: "run.updated",
+@@ -322,7 +374,11 @@ export const make = Effect.gen(function* () {
+           runId: run.id,
+           providerInstanceId: run.providerInstanceId,
+           occurredAt: now,
+-          payload: { ...run, queueHeld: true },
++          payload: {
++            ...run,
++            queueHeld: true,
++            ...(queuePosition === undefined ? {} : { queuePosition }),
++          },
+         });
+       }
+       for (const request of requests) {
+diff --git a/apps/server/src/serverSettings.ts b/apps/server/src/serverSettings.ts
+index 2661d585b..d10963d9b 100644
+--- a/apps/server/src/serverSettings.ts
++++ b/apps/server/src/serverSettings.ts
+@@ -318,6 +318,19 @@ const ServerSettingsJson = fromLenientJson(
+   }),
+ );
+ const decodeServerSettingsJsonExit = Schema.decodeUnknownExit(ServerSettingsJson);
++
++function hasStoredContinuationKey(raw: string): boolean {
++  try {
++    const parsed: unknown = JSON.parse(raw);
++    return (
++      typeof parsed === "object" &&
++      parsed !== null &&
++      Object.hasOwn(parsed, "continueThreadsAfterServerUpdate")
++    );
++  } catch {
++    return false;
++  }
++}
+ /**
+  * The retired `providers.<kind>` map, read without its old schemas. Before
+  * `providerInstances` existed each built-in driver had one blob there; it
+@@ -724,9 +737,11 @@ const make = Effect.gen(function* () {
+     // A file that failed to decode must stay on disk for the user to repair;
+     // the fold below only writes when it started from the file's real contents.
+     let settingsFileTrusted = true;
++    let continuationKeyStored = false;
+ 
+     if (yield* readConfigExists) {
+       const raw = yield* readRawConfig;
++      continuationKeyStored = hasStoredContinuationKey(raw);
+       const decoded = decodeServerSettingsJsonExit(raw);
+       const legacySettings = decodeLegacyProviderSettingsJsonExit(raw);
+       if (legacySettings._tag === "Success") {
+@@ -802,6 +817,29 @@ const make = Effect.gen(function* () {
+             ),
+           );
+ 
++    // 0.0.x defaulted `continueThreadsAfterServerUpdate` to false and so never
++    // wrote it; this version defaults it to true. A database that already holds
++    // 0.0.x threads keeps the old meaning: the key is written as false once.
++    const keepLegacyContinuationOptOut =
++      settingsFileTrusted &&
++      !continuationKeyStored &&
++      (yield* sql<{ readonly legacy: number }>`
++        SELECT EXISTS (SELECT 1 FROM projection_threads) AS legacy
++      `.pipe(
++        Effect.map((rows) => rows[0]?.legacy === 1),
++        Effect.mapError(
++          (cause) =>
++            new ServerSettingsError({
++              settingsPath,
++              operation: "read-legacy-threads",
++              cause,
++            }),
++        ),
++      ));
++    if (keepLegacyContinuationOptOut) {
++      settings = { ...settings, continueThreadsAfterServerUpdate: false };
++    }
++
+     const loaded = foldProviderInstanceEnabledFlags(
+       legacyProviders === undefined
+         ? settings
+@@ -846,7 +884,8 @@ const make = Effect.gen(function* () {
+     if (
+       migrated !== loaded ||
+       (settingsFileTrusted && legacyProviders !== undefined) ||
+-      hasLegacySourceControl
++      hasLegacySourceControl ||
++      keepLegacyContinuationOptOut
+     ) {
+       yield* writeSettingsAtomically(migrated);
+       for (const move of sourceControlMigration.secretMoves) {
+-- 
+2.43.0
+

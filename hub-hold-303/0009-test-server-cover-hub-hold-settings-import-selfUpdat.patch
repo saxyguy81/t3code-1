@@ -1,0 +1,533 @@
+From 8c5e6f32e4a4e0da737d1f12637abd93e3515109 Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 05:19:14 -0700
+Subject: [PATCH 09/17] test(server): cover hub hold settings import,
+ selfUpdate guard, legacy dispatch (#303)
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ apps/server/src/cloud/selfUpdate.test.ts      | 109 +++++++
+ .../orchestration-v2/LegacyDispatch.test.ts   | 294 ++++++++++++++++++
+ apps/server/src/serverSettings.test.ts        |  60 ++++
+ 3 files changed, 463 insertions(+)
+ create mode 100644 apps/server/src/orchestration-v2/LegacyDispatch.test.ts
+
+diff --git a/apps/server/src/cloud/selfUpdate.test.ts b/apps/server/src/cloud/selfUpdate.test.ts
+index 443fad607..8e301e9ae 100644
+--- a/apps/server/src/cloud/selfUpdate.test.ts
++++ b/apps/server/src/cloud/selfUpdate.test.ts
+@@ -7,12 +7,14 @@ import * as Deferred from "effect/Deferred";
+ import * as Effect from "effect/Effect";
+ import * as FileSystem from "effect/FileSystem";
+ import * as Fiber from "effect/Fiber";
++import * as Layer from "effect/Layer";
+ import * as Path from "effect/Path";
+ import { HttpClient, HttpClientResponse } from "effect/http";
+ import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
+ 
+ import * as ServerConfig from "../config.ts";
+ import * as DesktopAppUpdate from "../desktopUpdate/DesktopAppUpdate.ts";
++import * as HubHold from "../orchestration-v2/HubHold.ts";
+ import * as ProcessRunner from "../processRunner.ts";
+ import * as ServiceLauncherClient from "./serviceLauncherClient.ts";
+ import { SERVICE_LAUNCHER_PROTOCOL } from "./serviceProtocol.ts";
+@@ -24,8 +26,28 @@ interface HarnessOptions {
+   readonly preflight?: "ready" | "blocked";
+   readonly requestUpdate?: ServiceLauncherClient.ServiceLauncherClient["Service"]["requestUpdate"];
+   readonly desktopAppUpdate?: DesktopAppUpdate.DesktopAppUpdate["Service"];
++  /** Defaults to a quiescent hub; "absent" leaves HubHoldV2 unprovided. */
++  readonly hubHold?: "absent" | Partial<HubHold.HubHoldV2["Service"]>;
+ }
+ 
++const quiescentCounts = {
++  queued: 0,
++  held: 0,
++  inFlight: 0,
++  outboxPending: 0,
++  outboxRunning: 0,
++  heldEffects: 0,
++};
++
++const hubHoldInventory = (counts: Partial<typeof quiescentCounts>) =>
++  Effect.succeed({
++    runtime: { version: "1.0.0", entryPath: null, bundleSha256: null },
++    hold: { held: false, actor: null, reason: null, changedAt: null },
++    counts: { ...quiescentCounts, ...counts },
++    continueThreadsAfterServerUpdate: { global: true, projectOverridesEnabled: [] },
++    readAt: "2026-10-16T00:00:00.000Z",
++  });
++
+ // The staged runtime is a release archive: the fake client serves SHA256SUMS
+ // and the tarball, and the fake runner stands in for tar before it answers
+ // the staged preflight.
+@@ -120,6 +142,14 @@ const makeHarness = Effect.fn("test.make_self_update_harness")(function* (
+       },
+     ),
+     Effect.provideService(HttpClient.HttpClient, releaseHttpClient(order)),
++    options.hubHold === "absent"
++      ? (effect) => effect
++      : Effect.provide(
++          Layer.mock(HubHold.HubHoldV2)({
++            inventory: hubHoldInventory({}),
++            ...options.hubHold,
++          }),
++        ),
+     Effect.provideService(HostProcess.Platform, "linux"),
+     Effect.provideService(HostProcess.Architecture, "x64"),
+     Effect.provide(ServerConfig.layer({ ...config, mode: options.mode ?? "web" })),
+@@ -422,4 +452,83 @@ it.layer(NodeServices.layer)("server self update", (it) => {
+       expect((yield* Fiber.join(first)).updateId).toBe("launcher-id");
+     }),
+   );
++
++  it.effect("refuses an update when the dispatch inventory is unavailable", () =>
++    Effect.gen(function* () {
++      const { selfUpdate, order } = yield* makeHarness({ hubHold: "absent" });
++      expect((yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason).toBe(
++        "Server updates are blocked: the dispatch inventory is unavailable.",
++      );
++      expect(order).not.toContain("accept");
++    }),
++  );
++
++  it.effect("refuses an update when the dispatch inventory cannot be read", () =>
++    Effect.gen(function* () {
++      const { selfUpdate, order } = yield* makeHarness({
++        hubHold: { inventory: Effect.fail(new HubHold.HubHoldError({ operation: "counts" })) },
++      });
++      expect((yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason).toBe(
++        "Server updates are blocked: the dispatch inventory could not be read.",
++      );
++      expect(order).not.toContain("accept");
++    }),
++  );
++
++  for (const [label, counts] of [
++    ["queued", { queued: 2 }],
++    ["in flight", { inFlight: 1 }],
++    ["claimed", { outboxRunning: 3 }],
++    ["held", { heldEffects: 4 }],
++  ] as const) {
++    it.effect(`refuses an update while ${label} provider work is pending`, () =>
++      Effect.gen(function* () {
++        const { selfUpdate, order } = yield* makeHarness({
++          hubHold: { inventory: hubHoldInventory(counts) },
++        });
++        const failure = yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip);
++        expect(failure.reason).toContain(
++          "Server updates are blocked while provider work is pending",
++        );
++        const {
++          queued = 0,
++          inFlight = 0,
++          outboxRunning = 0,
++          heldEffects = 0,
++        } = counts as Record<string, number>;
++        expect(failure.reason).toContain(
++          `(queued ${queued}, in flight ${inFlight}, claimed ${outboxRunning}, held ${heldEffects})`,
++        );
++        expect(order).not.toContain("accept");
++      }),
++    );
++  }
++
++  it.effect("refuses the desktop-app update path while provider work is pending", () =>
++    Effect.gen(function* () {
++      const { selfUpdate } = yield* makeHarness({
++        mode: "desktop",
++        hubHold: { inventory: hubHoldInventory({ queued: 1 }) },
++        desktopAppUpdate: {
++          available: true,
++          run: () => Effect.die("desktop update must not run"),
++          commit: () => Effect.never,
++        },
++      });
++      expect(
++        (yield* selfUpdate.update({ targetVersion: "1.1.0" }).pipe(Effect.flip)).reason,
++      ).toContain("provider work is pending");
++    }),
++  );
++
++  it.effect("proceeds to the launcher when no provider work is pending", () =>
++    Effect.gen(function* () {
++      const { selfUpdate, order } = yield* makeHarness({
++        hubHold: { inventory: hubHoldInventory({ held: 5, outboxPending: 2 }) },
++      });
++      // Idle queued-resume runs and ordinary pending effects do not block.
++      expect((yield* selfUpdate.update({ targetVersion: "1.1.0" })).updateId).toBe("launcher-id");
++      expect(order).toContain("accept");
++    }),
++  );
+ });
+diff --git a/apps/server/src/orchestration-v2/LegacyDispatch.test.ts b/apps/server/src/orchestration-v2/LegacyDispatch.test.ts
+new file mode 100644
+index 000000000..476e9cdff
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/LegacyDispatch.test.ts
+@@ -0,0 +1,294 @@
++import { assert, it } from "@effect/vitest";
++import { LegacyDispatchCommand } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as Schema from "effect/Schema";
++import * as SqlClient from "effect/sql/SqlClient";
++
++import * as SqlitePersistence from "../persistence/Sqlite.ts";
++import { translateLegacyDispatch } from "./LegacyDispatch.ts";
++
++const layerTest = () => Layer.fresh(SqlitePersistence.layerMemory);
++
++const decodeCommand = Schema.decodeUnknownSync(LegacyDispatchCommand);
++const timestamp = "2026-10-16T00:00:00.000Z";
++
++const seedThread = (input: {
++  readonly threadId: string;
++  readonly runtimeMode?: string;
++  readonly interactionMode?: string;
++  readonly payload?: Record<string, unknown>;
++}) =>
++  Effect.gen(function* () {
++    const sql = yield* SqlClient.SqlClient;
++    yield* sql`
++      INSERT INTO orchestration_v2_projection_threads (
++        thread_id, project_id, title, default_provider, runtime_mode, interaction_mode,
++        created_at, updated_at, payload_json
++      )
++      VALUES (
++        ${input.threadId}, ${"project:legacy"}, ${"Thread"}, ${"codex"},
++        ${input.runtimeMode ?? "full-access"}, ${input.interactionMode ?? "default"},
++        ${timestamp}, ${timestamp}, ${JSON.stringify(input.payload ?? {})}
++      )
++    `;
++  });
++
++const seedRun = (threadId: string, runId: string, ordinal: number, status: string) =>
++  Effect.gen(function* () {
++    const sql = yield* SqlClient.SqlClient;
++    yield* sql`
++      INSERT INTO orchestration_v2_projection_runs (
++        run_id, thread_id, ordinal, provider, status, requested_at, payload_json
++      )
++      VALUES (${runId}, ${threadId}, ${ordinal}, ${"codex"}, ${status}, ${timestamp}, ${"{}"})
++    `;
++  });
++
++const seedSession = (threadId: string, providerSessionId: string, status: string) =>
++  Effect.gen(function* () {
++    const sql = yield* SqlClient.SqlClient;
++    yield* sql`
++      INSERT INTO orchestration_v2_projection_provider_sessions (
++        provider_session_id, thread_id, provider, status, updated_at, payload_json
++      )
++      VALUES (${providerSessionId}, ${threadId}, ${"codex"}, ${status}, ${timestamp}, ${"{}"})
++    `;
++  });
++
++const turnStart = (threadId: string, runtimeMode: string, interactionMode: string) =>
++  decodeCommand({
++    type: "thread.turn.start",
++    commandId: "command:turn",
++    threadId,
++    message: {
++      messageId: "message:1",
++      role: "user",
++      text: "hello",
++      attachments: [],
++    },
++    runtimeMode,
++    interactionMode,
++    createdAt: timestamp,
++  });
++
++const stop = (threadId: string, onlyIfSettled?: boolean) =>
++  decodeCommand({
++    type: "thread.session.stop",
++    commandId: "command:stop",
++    threadId,
++    createdAt: timestamp,
++    ...(onlyIfSettled === undefined ? {} : { onlyIfSettled }),
++  });
++
++it.effect("queues a turn.start behind the active run without extra mode commands", () =>
++  Effect.gen(function* () {
++    yield* seedThread({ threadId: "thread:a" });
++    const commands = yield* translateLegacyDispatch(
++      turnStart("thread:a", "full-access", "default"),
++    );
++    assert.deepEqual(
++      commands.map((command) => command.type),
++      ["message.dispatch"],
++    );
++    const dispatch = commands[0];
++    assert.equal(dispatch?.commandId, "command:turn");
++    assert.deepEqual(dispatch?.type === "message.dispatch" && dispatch.dispatchMode, {
++      type: "queue_after_active",
++    });
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("sets runtime and interaction modes before dispatching only when they differ", () =>
++  Effect.gen(function* () {
++    yield* seedThread({ threadId: "thread:modes" });
++    const commands = yield* translateLegacyDispatch(
++      turnStart("thread:modes", "approval-required", "plan"),
++    );
++    assert.deepEqual(
++      commands.map((command) => [command.type, command.commandId]),
++      [
++        ["thread.runtime-mode.set", "command:turn:runtime-mode"],
++        ["thread.interaction-mode.set", "command:turn:interaction-mode"],
++        ["message.dispatch", "command:turn"],
++      ],
++    );
++
++    const runtimeOnly = yield* translateLegacyDispatch(
++      turnStart("thread:modes", "approval-required", "default"),
++    );
++    assert.deepEqual(
++      runtimeOnly.map((command) => command.type),
++      ["thread.runtime-mode.set", "message.dispatch"],
++    );
++    const interactionOnly = yield* translateLegacyDispatch(
++      turnStart("thread:modes", "full-access", "plan"),
++    );
++    assert.deepEqual(
++      interactionOnly.map((command) => command.type),
++      ["thread.interaction-mode.set", "message.dispatch"],
++    );
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect(
++  "maps turn.interrupt to one run.interrupt per active run, first keeps the command id",
++  () =>
++    Effect.gen(function* () {
++      yield* seedThread({ threadId: "thread:int" });
++      yield* seedRun("thread:int", "run:done", 1, "completed");
++      yield* seedRun("thread:int", "run:queued", 2, "queued");
++      yield* seedRun("thread:int", "run:old", 3, "running");
++      yield* seedRun("thread:int", "run:new", 4, "waiting");
++      const commands = yield* translateLegacyDispatch(
++        decodeCommand({
++          type: "thread.turn.interrupt",
++          commandId: "command:int",
++          threadId: "thread:int",
++          createdAt: timestamp,
++        }),
++      );
++      assert.deepEqual(
++        commands.map((command) => [
++          command.type,
++          command.commandId,
++          command.type === "run.interrupt" ? command.runId : null,
++        ]),
++        [
++          ["run.interrupt", "command:int", "run:new"],
++          ["run.interrupt", "command:int:interrupt:run:old", "run:old"],
++        ],
++      );
++    }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("returns no commands for turn.interrupt with nothing active", () =>
++  Effect.gen(function* () {
++    yield* seedThread({ threadId: "thread:idle" });
++    yield* seedRun("thread:idle", "run:done", 1, "completed");
++    const commands = yield* translateLegacyDispatch(
++      decodeCommand({
++        type: "thread.turn.interrupt",
++        commandId: "command:int",
++        threadId: "thread:idle",
++        createdAt: timestamp,
++      }),
++    );
++    assert.deepEqual(commands, []);
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect(
++  "skips a session.stop onlyIfSettled while the thread is unsettled or has a queued run",
++  () =>
++    Effect.gen(function* () {
++      yield* seedThread({ threadId: "thread:unsettled" });
++      yield* seedSession("thread:unsettled", "session:u", "ready");
++      assert.deepEqual(yield* translateLegacyDispatch(stop("thread:unsettled", true)), []);
++
++      yield* seedThread({ threadId: "thread:queued", payload: { settledAt: timestamp } });
++      yield* seedRun("thread:queued", "run:queued", 1, "queued");
++      yield* seedSession("thread:queued", "session:q", "ready");
++      assert.deepEqual(yield* translateLegacyDispatch(stop("thread:queued", true)), []);
++
++      // An unknown thread is treated as engaged, never stopped blindly.
++      assert.deepEqual(yield* translateLegacyDispatch(stop("thread:missing", true)), []);
++    }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("stops a settled thread's live sessions when onlyIfSettled holds", () =>
++  Effect.gen(function* () {
++    yield* seedThread({ threadId: "thread:settled", payload: { settledAt: timestamp } });
++    yield* seedRun("thread:settled", "run:done", 1, "completed");
++    yield* seedSession("thread:settled", "session:live", "ready");
++    yield* seedSession("thread:settled", "session:stopped", "stopped");
++    yield* seedSession("thread:settled", "session:error", "error");
++    const commands = yield* translateLegacyDispatch(stop("thread:settled", true));
++    assert.deepEqual(
++      commands.map((command) => [
++        command.type,
++        command.commandId,
++        command.type === "provider-session.detach" ? command.providerSessionId : null,
++      ]),
++      [["provider-session.detach", "command:stop", "session:live"]],
++    );
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("treats a settled override as settled even without settledAt", () =>
++  Effect.gen(function* () {
++    yield* seedThread({ threadId: "thread:override", payload: { settledOverride: "settled" } });
++    yield* seedSession("thread:override", "session:o", "ready");
++    const commands = yield* translateLegacyDispatch(stop("thread:override", true));
++    assert.deepEqual(
++      commands.map((command) => command.type),
++      ["provider-session.detach"],
++    );
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("interrupts every active run then detaches each live session on session.stop", () =>
++  Effect.gen(function* () {
++    yield* seedThread({ threadId: "thread:stop" });
++    yield* seedRun("thread:stop", "run:a", 1, "running");
++    yield* seedRun("thread:stop", "run:b", 2, "starting");
++    yield* seedSession("thread:stop", "session:1", "ready");
++    yield* seedSession("thread:stop", "session:dead", "stopped");
++    const commands = yield* translateLegacyDispatch(stop("thread:stop"));
++    assert.deepEqual(
++      commands.map((command) => [command.type, command.commandId]),
++      [
++        ["run.interrupt", "command:stop"],
++        ["run.interrupt", "command:stop:interrupt:run:a"],
++        ["provider-session.detach", "command:stop:detach:session:1"],
++      ],
++    );
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("splits meta.update into model-selection.set and metadata.update", () =>
++  Effect.gen(function* () {
++    const modelSelection = { instanceId: "codex", model: "gpt-5.5" };
++    const both = yield* translateLegacyDispatch(
++      decodeCommand({
++        type: "thread.meta.update",
++        commandId: "command:meta",
++        threadId: "thread:meta",
++        title: "Renamed",
++        modelSelection,
++        branch: null,
++      }),
++    );
++    assert.deepEqual(
++      both.map((command) => [command.type, command.commandId]),
++      [
++        ["thread.model-selection.set", "command:meta:model-selection"],
++        ["thread.metadata.update", "command:meta"],
++      ],
++    );
++    const metadata = both[1];
++    assert.deepEqual(metadata?.type === "thread.metadata.update" && metadata.title, "Renamed");
++    assert.isTrue(metadata?.type === "thread.metadata.update" && metadata.branch === null);
++
++    const modelOnly = yield* translateLegacyDispatch(
++      decodeCommand({
++        type: "thread.meta.update",
++        commandId: "command:meta",
++        threadId: "thread:meta",
++        modelSelection,
++      }),
++    );
++    assert.deepEqual(
++      modelOnly.map((command) => command.type),
++      ["thread.model-selection.set"],
++    );
++    const empty = yield* translateLegacyDispatch(
++      decodeCommand({
++        type: "thread.meta.update",
++        commandId: "command:meta",
++        threadId: "thread:meta",
++      }),
++    );
++    assert.deepEqual(empty, []);
++  }).pipe(Effect.provide(layerTest())),
++);
+diff --git a/apps/server/src/serverSettings.test.ts b/apps/server/src/serverSettings.test.ts
+index da696c2bc..3ecc0c78c 100644
+--- a/apps/server/src/serverSettings.test.ts
++++ b/apps/server/src/serverSettings.test.ts
+@@ -2205,4 +2205,64 @@ it.layer(NodeServices.layer)("server settings", (it) => {
+       assert.equal(yield* fileSystem.readFileString(serverConfig.settingsPath), broken);
+     }).pipe(Effect.provide(layerServerSettings())),
+   );
++
++  const insertLegacyThread = Effect.gen(function* () {
++    const sql = yield* SqlClient.SqlClient;
++    yield* sql`
++      INSERT INTO projection_threads (
++        thread_id, project_id, title, created_at, updated_at
++      )
++      VALUES (
++        ${"thread-legacy"}, ${"project-legacy"}, ${"Legacy"},
++        ${"2026-08-25T00:00:00.000Z"}, ${"2026-08-25T00:00:00.000Z"}
++      )
++    `;
++  });
++
++  it.effect(
++    "keeps the 0.0.x continuation opt-out when legacy threads exist and the key is unset",
++    () =>
++      Effect.gen(function* () {
++        const serverConfig = yield* ServerConfig.ServerConfig;
++        const fileSystem = yield* FileSystem.FileSystem;
++        const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
++        yield* insertLegacyThread;
++        yield* fileSystem.writeFileString(serverConfig.settingsPath, "{}");
++
++        const settings = yield* serverSettings.getSettings;
++        assert.isFalse(settings.continueThreadsAfterServerUpdate);
++        const persisted = JSON.parse(yield* fileSystem.readFileString(serverConfig.settingsPath));
++        assert.strictEqual(persisted.continueThreadsAfterServerUpdate, false);
++      }).pipe(Effect.provide(layerServerSettings())),
++  );
++
++  it.effect("keeps the 0.1.0 continuation default when there are no legacy threads", () =>
++    Effect.gen(function* () {
++      const serverConfig = yield* ServerConfig.ServerConfig;
++      const fileSystem = yield* FileSystem.FileSystem;
++      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
++      yield* fileSystem.writeFileString(serverConfig.settingsPath, "{}");
++
++      const settings = yield* serverSettings.getSettings;
++      assert.isTrue(settings.continueThreadsAfterServerUpdate);
++      const raw = yield* fileSystem.readFileString(serverConfig.settingsPath);
++      assert.isFalse(Object.hasOwn(JSON.parse(raw), "continueThreadsAfterServerUpdate"));
++    }).pipe(Effect.provide(layerServerSettings())),
++  );
++
++  it.effect("keeps an explicit continuation opt-in even when legacy threads exist", () =>
++    Effect.gen(function* () {
++      const serverConfig = yield* ServerConfig.ServerConfig;
++      const fileSystem = yield* FileSystem.FileSystem;
++      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
++      yield* insertLegacyThread;
++      yield* fileSystem.writeFileString(
++        serverConfig.settingsPath,
++        '{"continueThreadsAfterServerUpdate":true}',
++      );
++
++      const settings = yield* serverSettings.getSettings;
++      assert.isTrue(settings.continueThreadsAfterServerUpdate);
++    }).pipe(Effect.provide(layerServerSettings())),
++  );
+ });
+-- 
+2.43.0
+
