@@ -1,7 +1,7 @@
 From f03aa07afca078adc8bd702819beb017715a2e00 Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 04:56:50 -0700
-Subject: [PATCH 2/4] WIP hub hold: effect gating, recovery hold, settings
+Subject: [PATCH 2/6] WIP hub hold: effect gating, recovery hold, settings
  import default, selfUpdate guard (#303)
 
 Uncommitted work recovered from predecessor session fa30ad43.

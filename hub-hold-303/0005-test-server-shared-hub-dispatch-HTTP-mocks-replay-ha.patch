@@ -1,0 +1,145 @@
+From dbdcfa988ea6dac1e2cfb2f7a973154b888b17ad Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 05:11:41 -0700
+Subject: [PATCH 5/6] test(server): shared hub dispatch HTTP mocks; replay
+ harness provides SqlClient (#303)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../transferBudgetV2.integration.test.ts      |  2 ++
+ .../boundedSnapshotTransport.test.ts          | 17 ++---------------
+ apps/server/src/orchestration-v2/http.test.ts | 16 ++--------------
+ .../testkit/HubDispatchHttpMocks.ts           | 19 +++++++++++++++++++
+ .../testkit/ProviderReplayHarness.ts          |  1 +
+ 5 files changed, 26 insertions(+), 29 deletions(-)
+ create mode 100644 apps/server/src/orchestration-v2/testkit/HubDispatchHttpMocks.ts
+
+diff --git a/apps/server/integration/transferBudgetV2.integration.test.ts b/apps/server/integration/transferBudgetV2.integration.test.ts
+index 2b3a73f53..bef1c0ac8 100644
+--- a/apps/server/integration/transferBudgetV2.integration.test.ts
++++ b/apps/server/integration/transferBudgetV2.integration.test.ts
+@@ -47,6 +47,7 @@ import * as ProjectStore from "../src/orchestration-v2/ProjectStore.ts";
+ import * as ProjectService from "../src/project/ProjectService.ts";
+ import * as ProjectEnrichmentService from "../src/project/ProjectEnrichmentService.ts";
+ import * as OrchestrationHttp from "../src/orchestration-v2/http.ts";
++import { layerHubDispatchHttpMocks } from "../src/orchestration-v2/testkit/HubDispatchHttpMocks.ts";
+ import * as ServerHttp from "../src/http.ts";
+ import { subscribeOrchestrationV2Thread, subscribeOrchestrationV2Shell } from "../src/ws.ts";
+ import {
+@@ -160,6 +161,7 @@ const layerRoutes = Layer.mergeAll(
+   HttpApiBuilder.layer(TransferApi).pipe(
+     Layer.provide(OrchestrationHttp.layer),
+     Layer.provide(layerAuth),
++    Layer.provide(layerHubDispatchHttpMocks),
+   ),
+   RpcServer.layerHttp({ group, path: "/ws", protocol: "websocket" }).pipe(
+     Layer.provide(layerHandlers),
+diff --git a/apps/server/src/orchestration-v2/boundedSnapshotTransport.test.ts b/apps/server/src/orchestration-v2/boundedSnapshotTransport.test.ts
+index 6619f7381..94686d542 100644
+--- a/apps/server/src/orchestration-v2/boundedSnapshotTransport.test.ts
++++ b/apps/server/src/orchestration-v2/boundedSnapshotTransport.test.ts
+@@ -39,11 +39,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+ import * as SqlitePersistence from "../persistence/Sqlite.ts";
+ import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+ import * as ProjectEnrichmentService from "../project/ProjectEnrichmentService.ts";
+-import * as ServerConfig from "../config.ts";
+-import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
+-import * as HubHold from "./HubHold.ts";
+-import * as ThreadLaunchService from "./ThreadLaunchService.ts";
+-import * as ServerSettings from "../serverSettings.ts";
++import { layerHubDispatchHttpMocks } from "./testkit/HubDispatchHttpMocks.ts";
+ import { subscribeOrchestrationV2Thread } from "../ws.ts";
+ import * as OrchestrationHttp from "./http.ts";
+ import * as ProjectionStore from "./ProjectionStore.ts";
+@@ -249,16 +245,7 @@ const withHttp = <A>(use: (get: (path: string) => Promise<Response>) => Promise<
+       Layer.provide(OrchestrationHttp.layer),
+       Layer.provide(auth),
+       Layer.provide(Layer.succeedContext(context)),
+-      // Hub hold and 0.0.x dispatch services; these routes never reach them.
+-      Layer.provide(
+-        Layer.mergeAll(
+-          Layer.mock(HubHold.HubHoldV2)({}),
+-          Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({}),
+-          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+-          Layer.mock(ServerConfig.ServerConfig)({}),
+-          Layer.mock(ServerSettings.ServerSettingsService)({}),
+-        ),
+-      ),
++      Layer.provide(layerHubDispatchHttpMocks),
+       Layer.provide(NodeHttpPlatform.layer),
+       Layer.provide(Etag.layerWeak),
+       Layer.provide(NodeServices.layer),
+diff --git a/apps/server/src/orchestration-v2/http.test.ts b/apps/server/src/orchestration-v2/http.test.ts
+index 2a3f52f64..f7be9de45 100644
+--- a/apps/server/src/orchestration-v2/http.test.ts
++++ b/apps/server/src/orchestration-v2/http.test.ts
+@@ -30,10 +30,7 @@ import * as HttpApiBuilder from "effect/http-api/HttpApiBuilder";
+ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+ import * as SqlitePersistence from "../persistence/Sqlite.ts";
+ import * as ServerSettings from "../serverSettings.ts";
+-import * as ServerConfig from "../config.ts";
+-import * as ServerRuntimeStartup from "../serverRuntimeStartup.ts";
+-import * as HubHold from "./HubHold.ts";
+-import * as ThreadLaunchService from "./ThreadLaunchService.ts";
++import { layerHubDispatchHttpMocks } from "./testkit/HubDispatchHttpMocks.ts";
+ 
+ import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+ import { ProjectEnrichmentService } from "../project/ProjectEnrichmentService.ts";
+@@ -155,16 +152,7 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
+       ),
+       Layer.provide(Layer.succeedContext(services)),
+       Layer.provide(Layer.mock(ProjectEnrichmentService)({})),
+-      // Hub hold and 0.0.x dispatch services; these routes never reach them.
+-      Layer.provide(
+-        Layer.mergeAll(
+-          Layer.mock(HubHold.HubHoldV2)({}),
+-          Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({}),
+-          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+-          Layer.mock(ServerConfig.ServerConfig)({}),
+-          Layer.mock(ServerSettings.ServerSettingsService)({}),
+-        ),
+-      ),
++      Layer.provide(layerHubDispatchHttpMocks),
+       Layer.provide(HttpPlatform.layer),
+       Layer.provide(Etag.layerWeak),
+       Layer.provide(NodeServices.layer),
+diff --git a/apps/server/src/orchestration-v2/testkit/HubDispatchHttpMocks.ts b/apps/server/src/orchestration-v2/testkit/HubDispatchHttpMocks.ts
+new file mode 100644
+index 000000000..ae7b56a14
+--- /dev/null
++++ b/apps/server/src/orchestration-v2/testkit/HubDispatchHttpMocks.ts
+@@ -0,0 +1,19 @@
++import * as Layer from "effect/Layer";
++
++import * as ServerConfig from "../../config.ts";
++import * as ServerRuntimeStartup from "../../serverRuntimeStartup.ts";
++import * as ServerSettings from "../../serverSettings.ts";
++import * as HubHold from "../HubHold.ts";
++import * as ThreadLaunchService from "../ThreadLaunchService.ts";
++
++/**
++ * Services the orchestration HTTP group captures for the hub hold and the
++ * 0.0.x dispatch routes. For tests whose requests never reach those routes.
++ */
++export const layerHubDispatchHttpMocks = Layer.mergeAll(
++  Layer.mock(HubHold.HubHoldV2)({}),
++  Layer.mock(ServerRuntimeStartup.ServerRuntimeStartup)({}),
++  Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
++  Layer.mock(ServerSettings.ServerSettingsService)({}),
++  ServerConfig.layerTest(process.cwd(), { prefix: "t3-hub-dispatch-http-test-" }),
++);
+diff --git a/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts b/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
+index 1ee5fb996..2085a3984 100644
+--- a/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
++++ b/apps/server/src/orchestration-v2/testkit/ProviderReplayHarness.ts
+@@ -440,6 +440,7 @@ export function layerWithRegistry<Error>(
+   const layerOrchestratorProvided = Orchestrator.layer.pipe(
+     Layer.provide(
+       Layer.mergeAll(
++        layerDatabase,
+         layerCheckpointServiceProvided,
+         CommandPolicy.layer,
+         layerContextHandoffServiceProvided,
+-- 
+2.43.0
+
