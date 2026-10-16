@@ -1,0 +1,199 @@
+From 12a73dfa0d5752bd3560f778715926da87881b8e Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 06:29:06 -0700
+Subject: [PATCH 16/16] test(server): compat onlyIfSettled refusal and
+ interrupt-retry idempotency (#303)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../orchestration-v2/LegacyDispatch.test.ts   | 145 ++++++++----------
+ 1 file changed, 63 insertions(+), 82 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/LegacyDispatch.test.ts b/apps/server/src/orchestration-v2/LegacyDispatch.test.ts
+index 555f6386d..f44ea9916 100644
+--- a/apps/server/src/orchestration-v2/LegacyDispatch.test.ts
++++ b/apps/server/src/orchestration-v2/LegacyDispatch.test.ts
+@@ -131,105 +131,44 @@ it.effect("sets runtime and interaction modes before dispatching only when they
+   }).pipe(Effect.provide(layerTest())),
+ );
+ 
+-it.effect(
+-  "maps turn.interrupt to one run.interrupt for the newest active run, keyed by run",
+-  () =>
+-    Effect.gen(function* () {
+-      yield* seedThread({ threadId: "thread:int" });
+-      yield* seedRun("thread:int", "run:done", 1, "completed");
+-      yield* seedRun("thread:int", "run:queued", 2, "queued");
+-      yield* seedRun("thread:int", "run:old", 3, "running");
+-      yield* seedRun("thread:int", "run:new", 4, "waiting");
+-      const commands = yield* translateLegacyDispatch(
+-        decodeCommand({
+-          type: "thread.turn.interrupt",
+-          commandId: "command:int",
+-          threadId: "thread:int",
+-          createdAt: timestamp,
+-        }),
+-      );
+-      assert.deepEqual(
+-        commands.map(
+-          (command) =>
+-            `${command.type} ${command.commandId} ${command.type === "run.interrupt" ? command.runId : ""}`,
+-        ),
+-        ["run.interrupt command:int:interrupt:run:new run:new"],
+-      );
+-    }).pipe(Effect.provide(layerTest())),
+-);
+-
+-it.effect("returns no commands for turn.interrupt with nothing active", () =>
++it.effect("maps turn.interrupt to one run.interrupt for the newest active run, keyed by run", () =>
+   Effect.gen(function* () {
+-    yield* seedThread({ threadId: "thread:idle" });
+-    yield* seedRun("thread:idle", "run:done", 1, "completed");
++    yield* seedThread({ threadId: "thread:int" });
++    yield* seedRun("thread:int", "run:done", 1, "completed");
++    yield* seedRun("thread:int", "run:queued", 2, "queued");
++    yield* seedRun("thread:int", "run:old", 3, "running");
++    yield* seedRun("thread:int", "run:new", 4, "waiting");
+     const commands = yield* translateLegacyDispatch(
+       decodeCommand({
+         type: "thread.turn.interrupt",
+         commandId: "command:int",
+-        threadId: "thread:idle",
++        threadId: "thread:int",
+         createdAt: timestamp,
+       }),
+     );
+-    assert.deepEqual(commands, []);
+-  }).pipe(Effect.provide(layerTest())),
+-);
+-
+-it.effect(
+-  "skips a session.stop onlyIfSettled while the thread is unsettled or has a queued run",
+-  () =>
+-    Effect.gen(function* () {
+-      yield* seedThread({ threadId: "thread:unsettled" });
+-      yield* seedSession("thread:unsettled", "session:u", "ready");
+-      assert.deepEqual(yield* translateLegacyDispatch(stop("thread:unsettled", true)), []);
+-
+-      yield* seedThread({ threadId: "thread:queued", payload: { settledAt: timestamp } });
+-      yield* seedRun("thread:queued", "run:queued", 1, "queued");
+-      yield* seedSession("thread:queued", "session:q", "ready");
+-      assert.deepEqual(yield* translateLegacyDispatch(stop("thread:queued", true)), []);
+-
+-      // An unknown thread is treated as engaged, never stopped blindly.
+-      assert.deepEqual(yield* translateLegacyDispatch(stop("thread:missing", true)), []);
+-    }).pipe(Effect.provide(layerTest())),
+-);
+-
+-it.effect("stops a settled thread's live sessions when onlyIfSettled holds", () =>
+-  Effect.gen(function* () {
+-    yield* seedThread({
+-      threadId: "thread:settled",
+-      payload: { settledAt: timestamp, settledOverride: "settled" },
+-    });
+-    yield* seedRun("thread:settled", "run:done", 1, "completed");
+-    yield* seedSession("thread:settled", "session:live", "ready");
+-    yield* seedSession("thread:settled", "session:stopped", "stopped");
+-    yield* seedSession("thread:settled", "session:error", "error");
+-    const commands = yield* translateLegacyDispatch(stop("thread:settled", true));
+     assert.deepEqual(
+       commands.map(
+         (command) =>
+-          `${command.type} ${command.commandId} ${command.type === "provider-session.detach" ? command.providerSessionId : ""}`,
++          `${command.type} ${command.commandId} ${command.type === "run.interrupt" ? command.runId : ""}`,
+       ),
+-      ["provider-session.detach command:stop:detach:session:live session:live"],
++      ["run.interrupt command:int:interrupt:run:new run:new"],
+     );
+   }).pipe(Effect.provide(layerTest())),
+ );
+ 
+-it.effect("requires the settled override, as the 0.0.45 decider did", () =>
+-  Effect.gen(function* () {
+-    yield* seedThread({ threadId: "thread:auto-settled", payload: { settledAt: timestamp } });
+-    yield* seedSession("thread:auto-settled", "session:a", "ready");
+-    assert.deepEqual(yield* translateLegacyDispatch(stop("thread:auto-settled", true)), []);
+-  }).pipe(Effect.provide(layerTest())),
+-);
+-
+-it.effect("treats a settled override as settled even without settledAt", () =>
++it.effect("returns no commands for turn.interrupt with nothing active", () =>
+   Effect.gen(function* () {
+-    yield* seedThread({ threadId: "thread:override", payload: { settledOverride: "settled" } });
+-    yield* seedSession("thread:override", "session:o", "ready");
+-    const commands = yield* translateLegacyDispatch(stop("thread:override", true));
+-    assert.deepEqual(
+-      commands.map((command) => command.type),
+-      ["provider-session.detach"],
++    yield* seedThread({ threadId: "thread:idle" });
++    yield* seedRun("thread:idle", "run:done", 1, "completed");
++    const commands = yield* translateLegacyDispatch(
++      decodeCommand({
++        type: "thread.turn.interrupt",
++        commandId: "command:int",
++        threadId: "thread:idle",
++        createdAt: timestamp,
++      }),
+     );
++    assert.deepEqual(commands, []);
+   }).pipe(Effect.provide(layerTest())),
+ );
+ 
+@@ -266,7 +205,10 @@ it.effect("splits meta.update into model-selection.set and metadata.update", ()
+     );
+     assert.deepEqual(
+       both.map((command) => `${command.type} ${command.commandId}`),
+-      ["thread.model-selection.set command:meta:model-selection", "thread.metadata.update command:meta"],
++      [
++        "thread.model-selection.set command:meta:model-selection",
++        "thread.metadata.update command:meta",
++      ],
+     );
+     const metadata = both[1];
+     assert.deepEqual(metadata?.type === "thread.metadata.update" && metadata.title, "Renamed");
+@@ -330,3 +272,42 @@ it.effect("refuses a bootstrap turn.start instead of dropping the bootstrap", ()
+     assert.equal(failure._tag, "LegacyDispatchUnsupportedError");
+   }).pipe(Effect.provide(layerTest())),
+ );
++
++it.effect("refuses an onlyIfSettled session.stop instead of racing its check", () =>
++  Effect.gen(function* () {
++    yield* seedThread({ threadId: "thread:settled", payload: { settledOverride: "settled" } });
++    yield* seedSession("thread:settled", "session:live", "ready");
++    const failure = yield* translateLegacyDispatch(stop("thread:settled", true)).pipe(Effect.flip);
++    assert.equal(failure._tag, "LegacyDispatchUnsupportedError");
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("interrupts nothing on a retry once the command already interrupted a run", () =>
++  Effect.gen(function* () {
++    const sql = yield* SqlClient.SqlClient;
++    yield* seedThread({ threadId: "thread:retry" });
++    yield* seedRun("thread:retry", "run:first", 1, "completed");
++    yield* seedRun("thread:retry", "run:second", 2, "running");
++    yield* sql`
++      INSERT INTO orchestration_v2_command_receipts (
++        command_id, thread_id, command_type, accepted_at, result_sequence, status
++      )
++      VALUES (
++        ${"command:int:interrupt:run:first"}, ${"thread:retry"}, ${"run.interrupt"},
++        ${timestamp}, ${1}, ${"accepted"}
++      )
++    `;
++    const interrupt = decodeCommand({
++      type: "thread.turn.interrupt",
++      commandId: "command:int",
++      threadId: "thread:retry",
++      createdAt: timestamp,
++    });
++    assert.deepEqual(yield* translateLegacyDispatch(interrupt), []);
++    yield* seedSession("thread:retry", "session:live", "ready");
++    assert.deepEqual(
++      (yield* translateLegacyDispatch(stop("thread:retry"))).map((command) => command.type),
++      ["run.interrupt", "provider-session.detach"],
++    );
++  }).pipe(Effect.provide(layerTest())),
++);
+-- 
+2.43.0
+

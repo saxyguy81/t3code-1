@@ -1,7 +1,7 @@
 From 1017b8d9a6a5b68ff473bc28478031729deddcf1 Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 06:07:12 -0700
-Subject: [PATCH 11/15] fix(server): compat dispatch retries are idempotent and
+Subject: [PATCH 11/16] fix(server): compat dispatch retries are idempotent and
  match 0.0.45 scope (#303)
 
 Review 1 items 4-7:

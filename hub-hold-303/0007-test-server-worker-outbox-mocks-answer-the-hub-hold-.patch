@@ -1,7 +1,7 @@
 From 79abb7729673783784354d0c237504a59e7cceb3 Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 05:16:02 -0700
-Subject: [PATCH 07/15] test(server): worker outbox mocks answer the hub hold
+Subject: [PATCH 07/16] test(server): worker outbox mocks answer the hub hold
  check as not held (#303)
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
