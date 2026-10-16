@@ -1,7 +1,7 @@
 From 12a73dfa0d5752bd3560f778715926da87881b8e Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 06:29:06 -0700
-Subject: [PATCH 16/16] test(server): compat onlyIfSettled refusal and
+Subject: [PATCH 16/17] test(server): compat onlyIfSettled refusal and
  interrupt-retry idempotency (#303)
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>

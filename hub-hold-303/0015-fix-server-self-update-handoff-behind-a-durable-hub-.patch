@@ -1,7 +1,7 @@
 From 6f3ff1417f55be6b3589f4c1c9a67f6ab2a41ba9 Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 06:27:37 -0700
-Subject: [PATCH 15/16] fix(server): self-update handoff behind a durable
+Subject: [PATCH 15/17] fix(server): self-update handoff behind a durable
  hub-hold barrier (#303)
 
 Independent review NO-GO blocker: the guard ignored pending non-holdable
