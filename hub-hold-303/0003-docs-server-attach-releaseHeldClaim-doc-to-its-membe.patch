@@ -1,7 +1,7 @@
 From 4e5af593892c25b32e1e48a8261bcef8cdd19d71 Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 05:08:33 -0700
-Subject: [PATCH 3/3] docs(server): attach releaseHeldClaim doc to its member
+Subject: [PATCH 3/4] docs(server): attach releaseHeldClaim doc to its member
  (#303)
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
