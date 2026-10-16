@@ -1,0 +1,340 @@
+From 721c95c1f9d354143b72dfb97f4069c1e31dd92b Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 06:09:52 -0700
+Subject: [PATCH 12/12] test(server): compat dispatch and hold-blocker
+ regressions (#303)
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/orchestration-v2/HubHold.test.ts      |  81 +++++++++++++-
+ .../orchestration-v2/LegacyDispatch.test.ts   | 100 ++++++++++++------
+ apps/server/src/orchestration-v2/http.ts      |  42 ++++----
+ 3 files changed, 172 insertions(+), 51 deletions(-)
+
+diff --git a/apps/server/src/orchestration-v2/HubHold.test.ts b/apps/server/src/orchestration-v2/HubHold.test.ts
+index 91ead101b..d30066595 100644
+--- a/apps/server/src/orchestration-v2/HubHold.test.ts
++++ b/apps/server/src/orchestration-v2/HubHold.test.ts
+@@ -1,6 +1,14 @@
+ import * as NodeServices from "@effect/platform-node/NodeServices";
+ import { assert, it } from "@effect/vitest";
+-import { CommandId, RunId, ThreadId } from "@t3tools/contracts";
++import {
++  CommandId,
++  MessageId,
++  ProviderSessionId,
++  ProviderThreadId,
++  ProviderTurnId,
++  RunId,
++  ThreadId,
++} from "@t3tools/contracts";
+ import * as Effect from "effect/Effect";
+ import * as Layer from "effect/Layer";
+ import * as Option from "effect/Option";
+@@ -173,3 +181,74 @@ it.effect("reads back continuation settings and runtime identity in the inventor
+     });
+   }).pipe(Effect.provide(layerTest({ continueThreadsAfterServerUpdate: false }))),
+ );
++
++it.effect("lets an interrupt behind held input on the same thread run under the hold", () =>
++  Effect.gen(function* () {
++    const hold = yield* HubHold.HubHoldV2;
++    const outbox = yield* EffectOutbox.EffectOutboxV2;
++    const busy = ThreadId.make("thread:hub-hold:busy");
++    const turn = {
++      providerSessionId: ProviderSessionId.make("session:hub-hold"),
++      providerThreadId: ProviderThreadId.make("provider-thread:hub-hold"),
++      providerTurnId: ProviderTurnId.make("provider-turn:hub-hold"),
++    };
++    yield* hold.set(operator);
++    yield* outbox.enqueue([
++      {
++        id: "effect:hub-hold:steer",
++        commandId: CommandId.make("command:hub-hold:steer"),
++        threadId: busy,
++        request: { type: "provider-turn.steer", ...turn, messageId: MessageId.make("message:steer") },
++      },
++    ]);
++    yield* outbox.enqueue([
++      {
++        id: "effect:hub-hold:interrupt",
++        commandId: CommandId.make("command:hub-hold:interrupt"),
++        threadId: busy,
++        request: { type: "provider-turn.interrupt", ...turn },
++      },
++    ]);
++    // Stop must not wait for the held steer queued ahead of it.
++    const interrupt = yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 });
++    assert.equal(Option.getOrThrow(interrupt).id, "effect:hub-hold:interrupt");
++    yield* outbox.succeed({ effectId: "effect:hub-hold:interrupt", workerId: "w" });
++    assert.isTrue(
++      Option.isNone(yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 })),
++    );
++    // The steer is still held, then runs once after the clear.
++    yield* hold.clear({ ...operator, reason: "window over" });
++    const steer = yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 });
++    assert.equal(Option.getOrThrow(steer).id, "effect:hub-hold:steer");
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("keeps per-thread order behind pending input when no hold is set", () =>
++  Effect.gen(function* () {
++    const outbox = yield* EffectOutbox.EffectOutboxV2;
++    const busy = ThreadId.make("thread:hub-hold:fifo");
++    const turn = {
++      providerSessionId: ProviderSessionId.make("session:hub-hold:fifo"),
++      providerThreadId: ProviderThreadId.make("provider-thread:hub-hold:fifo"),
++      providerTurnId: ProviderTurnId.make("provider-turn:hub-hold:fifo"),
++    };
++    yield* outbox.enqueue([
++      {
++        id: "effect:hub-hold:fifo-steer",
++        commandId: CommandId.make("command:hub-hold:fifo-steer"),
++        threadId: busy,
++        request: { type: "provider-turn.steer", ...turn, messageId: MessageId.make("message:fifo") },
++      },
++    ]);
++    yield* outbox.enqueue([
++      {
++        id: "effect:hub-hold:fifo-interrupt",
++        commandId: CommandId.make("command:hub-hold:fifo-interrupt"),
++        threadId: busy,
++        request: { type: "provider-turn.interrupt", ...turn },
++      },
++    ]);
++    const first = yield* outbox.claimNext({ workerId: "w", leaseDurationMs: 30_000 });
++    assert.equal(Option.getOrThrow(first).id, "effect:hub-hold:fifo-steer");
++  }).pipe(Effect.provide(layerTest())),
++);
+diff --git a/apps/server/src/orchestration-v2/LegacyDispatch.test.ts b/apps/server/src/orchestration-v2/LegacyDispatch.test.ts
+index 476e9cdff..555f6386d 100644
+--- a/apps/server/src/orchestration-v2/LegacyDispatch.test.ts
++++ b/apps/server/src/orchestration-v2/LegacyDispatch.test.ts
+@@ -106,11 +106,11 @@ it.effect("sets runtime and interaction modes before dispatching only when they
+       turnStart("thread:modes", "approval-required", "plan"),
+     );
+     assert.deepEqual(
+-      commands.map((command) => [command.type, command.commandId]),
++      commands.map((command) => `${command.type} ${command.commandId}`),
+       [
+-        ["thread.runtime-mode.set", "command:turn:runtime-mode"],
+-        ["thread.interaction-mode.set", "command:turn:interaction-mode"],
+-        ["message.dispatch", "command:turn"],
++        "thread.runtime-mode.set command:turn:runtime-mode",
++        "thread.interaction-mode.set command:turn:interaction-mode",
++        "message.dispatch command:turn",
+       ],
+     );
+ 
+@@ -132,7 +132,7 @@ it.effect("sets runtime and interaction modes before dispatching only when they
+ );
+ 
+ it.effect(
+-  "maps turn.interrupt to one run.interrupt per active run, first keeps the command id",
++  "maps turn.interrupt to one run.interrupt for the newest active run, keyed by run",
+   () =>
+     Effect.gen(function* () {
+       yield* seedThread({ threadId: "thread:int" });
+@@ -149,15 +149,11 @@ it.effect(
+         }),
+       );
+       assert.deepEqual(
+-        commands.map((command) => [
+-          command.type,
+-          command.commandId,
+-          command.type === "run.interrupt" ? command.runId : null,
+-        ]),
+-        [
+-          ["run.interrupt", "command:int", "run:new"],
+-          ["run.interrupt", "command:int:interrupt:run:old", "run:old"],
+-        ],
++        commands.map(
++          (command) =>
++            `${command.type} ${command.commandId} ${command.type === "run.interrupt" ? command.runId : ""}`,
++        ),
++        ["run.interrupt command:int:interrupt:run:new run:new"],
+       );
+     }).pipe(Effect.provide(layerTest())),
+ );
+@@ -198,23 +194,33 @@ it.effect(
+ 
+ it.effect("stops a settled thread's live sessions when onlyIfSettled holds", () =>
+   Effect.gen(function* () {
+-    yield* seedThread({ threadId: "thread:settled", payload: { settledAt: timestamp } });
++    yield* seedThread({
++      threadId: "thread:settled",
++      payload: { settledAt: timestamp, settledOverride: "settled" },
++    });
+     yield* seedRun("thread:settled", "run:done", 1, "completed");
+     yield* seedSession("thread:settled", "session:live", "ready");
+     yield* seedSession("thread:settled", "session:stopped", "stopped");
+     yield* seedSession("thread:settled", "session:error", "error");
+     const commands = yield* translateLegacyDispatch(stop("thread:settled", true));
+     assert.deepEqual(
+-      commands.map((command) => [
+-        command.type,
+-        command.commandId,
+-        command.type === "provider-session.detach" ? command.providerSessionId : null,
+-      ]),
+-      [["provider-session.detach", "command:stop", "session:live"]],
++      commands.map(
++        (command) =>
++          `${command.type} ${command.commandId} ${command.type === "provider-session.detach" ? command.providerSessionId : ""}`,
++      ),
++      ["provider-session.detach command:stop:detach:session:live session:live"],
+     );
+   }).pipe(Effect.provide(layerTest())),
+ );
+ 
++it.effect("requires the settled override, as the 0.0.45 decider did", () =>
++  Effect.gen(function* () {
++    yield* seedThread({ threadId: "thread:auto-settled", payload: { settledAt: timestamp } });
++    yield* seedSession("thread:auto-settled", "session:a", "ready");
++    assert.deepEqual(yield* translateLegacyDispatch(stop("thread:auto-settled", true)), []);
++  }).pipe(Effect.provide(layerTest())),
++);
++
+ it.effect("treats a settled override as settled even without settledAt", () =>
+   Effect.gen(function* () {
+     yield* seedThread({ threadId: "thread:override", payload: { settledOverride: "settled" } });
+@@ -227,7 +233,7 @@ it.effect("treats a settled override as settled even without settledAt", () =>
+   }).pipe(Effect.provide(layerTest())),
+ );
+ 
+-it.effect("interrupts every active run then detaches each live session on session.stop", () =>
++it.effect("interrupts the newest active run then detaches each live session on session.stop", () =>
+   Effect.gen(function* () {
+     yield* seedThread({ threadId: "thread:stop" });
+     yield* seedRun("thread:stop", "run:a", 1, "running");
+@@ -236,11 +242,10 @@ it.effect("interrupts every active run then detaches each live session on sessio
+     yield* seedSession("thread:stop", "session:dead", "stopped");
+     const commands = yield* translateLegacyDispatch(stop("thread:stop"));
+     assert.deepEqual(
+-      commands.map((command) => [command.type, command.commandId]),
++      commands.map((command) => `${command.type} ${command.commandId}`),
+       [
+-        ["run.interrupt", "command:stop"],
+-        ["run.interrupt", "command:stop:interrupt:run:a"],
+-        ["provider-session.detach", "command:stop:detach:session:1"],
++        "run.interrupt command:stop:interrupt:run:b",
++        "provider-session.detach command:stop:detach:session:1",
+       ],
+     );
+   }).pipe(Effect.provide(layerTest())),
+@@ -260,11 +265,8 @@ it.effect("splits meta.update into model-selection.set and metadata.update", ()
+       }),
+     );
+     assert.deepEqual(
+-      both.map((command) => [command.type, command.commandId]),
+-      [
+-        ["thread.model-selection.set", "command:meta:model-selection"],
+-        ["thread.metadata.update", "command:meta"],
+-      ],
++      both.map((command) => `${command.type} ${command.commandId}`),
++      ["thread.model-selection.set command:meta:model-selection", "thread.metadata.update command:meta"],
+     );
+     const metadata = both[1];
+     assert.deepEqual(metadata?.type === "thread.metadata.update" && metadata.title, "Renamed");
+@@ -292,3 +294,39 @@ it.effect("splits meta.update into model-selection.set and metadata.update", ()
+     assert.deepEqual(empty, []);
+   }).pipe(Effect.provide(layerTest())),
+ );
++
++it.effect("leaves the thread's modes alone when a turn.start omits them", () =>
++  Effect.gen(function* () {
++    yield* seedThread({ threadId: "thread:no-modes", runtimeMode: "approval-required" });
++    const commands = yield* translateLegacyDispatch(
++      decodeCommand({
++        type: "thread.turn.start",
++        commandId: "command:turn",
++        threadId: "thread:no-modes",
++        message: { messageId: "message:1", role: "user", text: "hello", attachments: [] },
++        createdAt: timestamp,
++      }),
++    );
++    assert.deepEqual(
++      commands.map((command) => command.type),
++      ["message.dispatch"],
++    );
++  }).pipe(Effect.provide(layerTest())),
++);
++
++it.effect("refuses a bootstrap turn.start instead of dropping the bootstrap", () =>
++  Effect.gen(function* () {
++    yield* seedThread({ threadId: "thread:bootstrap" });
++    const failure = yield* translateLegacyDispatch(
++      decodeCommand({
++        type: "thread.turn.start",
++        commandId: "command:turn",
++        threadId: "thread:bootstrap",
++        message: { messageId: "message:1", role: "user", text: "hello", attachments: [] },
++        bootstrap: { createThread: true },
++        createdAt: timestamp,
++      }),
++    ).pipe(Effect.flip);
++    assert.equal(failure._tag, "LegacyDispatchUnsupportedError");
++  }).pipe(Effect.provide(layerTest())),
++);
+diff --git a/apps/server/src/orchestration-v2/http.ts b/apps/server/src/orchestration-v2/http.ts
+index f803a9171..a81f6e740 100644
+--- a/apps/server/src/orchestration-v2/http.ts
++++ b/apps/server/src/orchestration-v2/http.ts
+@@ -232,13 +232,17 @@ export const layer = HttpApiBuilder.group(
+           const commands = yield* translateLegacyDispatch(args.payload).pipe(
+             Effect.provide(intakeContext),
+             Effect.catch((cause) =>
+-              cause._tag === "LegacyDispatchUnsupportedError"
+-                ? Effect.logWarning("Legacy dispatch command is not supported", {
+-                    commandId: args.payload.commandId,
+-                    actor,
+-                    reason: cause.reason,
+-                  }).pipe(Effect.andThen(failEnvironmentInvalidRequest("invalid_command")))
+-                : failEnvironmentInternal("internal_error", cause),
++              Effect.gen(function* () {
++                if (cause._tag !== "LegacyDispatchUnsupportedError") {
++                  return yield* failEnvironmentInternal("internal_error", cause);
++                }
++                yield* Effect.logWarning("Legacy dispatch command is not supported", {
++                  commandId: args.payload.commandId,
++                  actor,
++                  reason: cause.reason,
++                });
++                return yield* failEnvironmentInvalidRequest("invalid_command");
++              }),
+             ),
+           );
+           let sequence = yield* applicationEvents.latestApplicationSequence.pipe(
+@@ -261,18 +265,18 @@ export const layer = HttpApiBuilder.group(
+                 // fault; anything else is ours, so a client may retry it. Every
+                 // translated command id is stable, so a retry is idempotent.
+                 Effect.catch((cause) =>
+-                  Effect.logWarning("Legacy dispatch command was rejected", {
+-                    commandId: command.commandId,
+-                    commandType: command.type,
+-                    actor,
+-                    cause,
+-                  }).pipe(
+-                    Effect.andThen(
+-                      userFacingDispatchErrorMessage(cause) === undefined
+-                        ? failEnvironmentInternal("internal_error", cause)
+-                        : failEnvironmentInvalidRequest("invalid_command"),
+-                    ),
+-                  ),
++                  Effect.gen(function* () {
++                    yield* Effect.logWarning("Legacy dispatch command was rejected", {
++                      commandId: command.commandId,
++                      commandType: command.type,
++                      actor,
++                      cause,
++                    });
++                    if (userFacingDispatchErrorMessage(cause) === undefined) {
++                      return yield* failEnvironmentInternal("internal_error", cause);
++                    }
++                    return yield* failEnvironmentInvalidRequest("invalid_command");
++                  }),
+                 ),
+               );
+             sequence = result.sequence;
+-- 
+2.43.0
+

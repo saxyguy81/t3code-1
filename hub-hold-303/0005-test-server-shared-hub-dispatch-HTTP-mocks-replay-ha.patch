@@ -1,7 +1,7 @@
 From dbdcfa988ea6dac1e2cfb2f7a973154b888b17ad Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 05:11:41 -0700
-Subject: [PATCH 05/11] test(server): shared hub dispatch HTTP mocks; replay
+Subject: [PATCH 05/12] test(server): shared hub dispatch HTTP mocks; replay
  harness provides SqlClient (#303)
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
