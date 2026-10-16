@@ -1,7 +1,7 @@
 From 4647eb512d4f6e5a15df3ab01357feda35710989 Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 04:21:59 -0700
-Subject: [PATCH 1/9] WIP hub hold, inventory, legacy dispatch (#303)
+Subject: [PATCH 01/10] WIP hub hold, inventory, legacy dispatch (#303)
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 ---
