@@ -1,7 +1,7 @@
 From 8c5e6f32e4a4e0da737d1f12637abd93e3515109 Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 05:19:14 -0700
-Subject: [PATCH 09/10] test(server): cover hub hold settings import,
+Subject: [PATCH 09/11] test(server): cover hub hold settings import,
  selfUpdate guard, legacy dispatch (#303)
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
