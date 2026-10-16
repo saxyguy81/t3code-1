@@ -1,7 +1,7 @@
 From 721c95c1f9d354143b72dfb97f4069c1e31dd92b Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 06:09:52 -0700
-Subject: [PATCH 12/12] test(server): compat dispatch and hold-blocker
+Subject: [PATCH 12/13] test(server): compat dispatch and hold-blocker
  regressions (#303)
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>

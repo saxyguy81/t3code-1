@@ -1,0 +1,202 @@
+From 8e268a8d9fc2418ea76419ab5a6aea0b9215919b Mon Sep 17 00:00:00 2001
+From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
+Date: Fri, 16 Oct 2026 06:16:21 -0700
+Subject: [PATCH 13/13] chore(server): bump @anthropic-ai/claude-agent-sdk to
+ 0.3.301 (claudeCode 2.1.301) (#303)
+
+Scott's ask: 0.3.276 bundles Claude Code 2.1.276, below the manifest minimum
+for claude-haiku-5-5 (2.1.293), claude-sonnet-5-5 (2.1.284) and
+claude-opus-5-5 (2.1.280).
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/server/package.json |  2 +-
+ pnpm-lock.yaml           | 58 +++++++++++++++++++---------------------
+ pnpm-workspace.yaml      |  2 +-
+ 3 files changed, 29 insertions(+), 33 deletions(-)
+
+diff --git a/apps/server/package.json b/apps/server/package.json
+index d4f95a1c1..a1d0c501e 100644
+--- a/apps/server/package.json
++++ b/apps/server/package.json
+@@ -29,7 +29,7 @@
+     "record:muse-replay": "node scripts/record-muse-msp-replay-fixture.ts"
+   },
+   "dependencies": {
+-    "@anthropic-ai/claude-agent-sdk": "^0.3.276",
++    "@anthropic-ai/claude-agent-sdk": "^0.3.301",
+     "@cursor/sdk": "1.0.35",
+     "@effect/platform-node": "catalog:",
+     "@effect/platform-node-shared": "catalog:",
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 8b93dc7c3..34ed8e094 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -584,7 +584,7 @@ importers:
+         version: 4.0.4(patch_hash=ebaec66c6bdd25e1b8d5bfd4a14f25ab959bdcca6e22ed8871d061e50e2db0ad)(@types/node@24.12.4)(@vitest/ui@5.0.1)(bufferutil@4.1.0)(effect@4.0.4)(esbuild@0.28.2)(jiti@2.7.0)(jsdom@30.1.0(@noble/hashes@1.8.0))(msw@2.12.11(@types/node@24.12.4)(typescript@7.0.2))(terser@5.48.0)(typescript@7.0.2)(unrun@0.2.39)(utf-8-validate@6.0.6)(yaml@2.9.0)
+       '@pierre/trees':
+         specifier: 1.0.0-beta.6
+-        version: 1.0.0-beta.6(@pierre/theme@2.0.0)(@shikijs/themes@4.2.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(shiki@4.2.0)
++        version: 1.0.0-beta.6(@pierre/theme@1.1.0)(@shikijs/themes@4.2.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(shiki@4.2.0)
+       '@types/mdast':
+         specifier: ^4.0.4
+         version: 4.0.4
+@@ -610,8 +610,8 @@ importers:
+   apps/server:
+     dependencies:
+       '@anthropic-ai/claude-agent-sdk':
+-        specifier: ^0.3.276
+-        version: 0.3.276(@anthropic-ai/sdk@0.93.0(zod@4.6.5))(@modelcontextprotocol/sdk@1.29.0(zod@4.6.5))(zod@4.6.5)
++        specifier: ^0.3.301
++        version: 0.3.301(@anthropic-ai/sdk@0.93.0(zod@4.6.5))(@modelcontextprotocol/sdk@1.29.0(zod@4.6.5))(zod@4.6.5)
+       '@cursor/sdk':
+         specifier: 1.0.35
+         version: 1.0.35
+@@ -798,7 +798,7 @@ importers:
+         version: 1.5.2(patch_hash=298e94372dbd51846a4e26ece2ecc3e22eb1f94b0450b1f1a9c6fec127809be7)(@shikijs/themes@4.3.0)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)
+       '@pierre/trees':
+         specifier: 1.0.0-beta.6
+-        version: 1.0.0-beta.6(@pierre/theme@1.1.0)(@shikijs/themes@4.3.0)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(shiki@4.2.0)
++        version: 1.0.0-beta.6(@pierre/theme@2.0.0)(@shikijs/themes@4.3.0)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(shiki@4.2.0)
+       '@t3tools/client-runtime':
+         specifier: workspace:*
+         version: link:../../packages/client-runtime
+@@ -1954,8 +1954,8 @@ packages:
+   '@antfu/install-pkg@2.1.0':
+     resolution: {integrity: sha512-sdg9NxU3zR4Mnawfbc/x6GB5Wf17WYud5qOuEuxXjaKpYpMkISSJEjItGebXJ2bQ4DIcly4NYH23mtkGJjvKUw==}
+ 
+-  '@anthropic-ai/claude-agent-sdk@0.3.276':
+-    resolution: {integrity: sha512-Dic43v4uuGLhibPAArWy3RSfq3zHdn+4Oh2AI2/18a5tlbNKkvChEpazyp8c+grUJvzxkzt0jETCa1wrADbkyw==}
++  '@anthropic-ai/claude-agent-sdk@0.3.301':
++    resolution: {integrity: sha512-mAe4zIFRL9BejcFHQVc+D0gxrMR/7mDt5GgdekfWB2DNWZebHoeGhgP2R3rZ/BcEZnW10nSGV2IwWyywwZw83Q==}
+     engines: {node: '>=18.0.0'}
+     peerDependencies:
+       '@anthropic-ai/sdk': '>=0.93.0'
+@@ -12477,7 +12477,7 @@ snapshots:
+       package-manager-detector: 1.8.0
+       tinyexec: 1.3.1
+ 
+-  '@anthropic-ai/claude-agent-sdk@0.3.276(@anthropic-ai/sdk@0.93.0(zod@4.6.5))(@modelcontextprotocol/sdk@1.29.0(zod@4.6.5))(zod@4.6.5)':
++  '@anthropic-ai/claude-agent-sdk@0.3.301(@anthropic-ai/sdk@0.93.0(zod@4.6.5))(@modelcontextprotocol/sdk@1.29.0(zod@4.6.5))(zod@4.6.5)':
+     dependencies:
+       '@anthropic-ai/sdk': 0.93.0(zod@4.6.5)
+       '@modelcontextprotocol/sdk': 1.29.0(zod@4.6.5)
+@@ -15824,20 +15824,20 @@ snapshots:
+ 
+   '@pierre/theme@2.0.0': {}
+ 
+-  '@pierre/theming@1.0.0(@pierre/theme@1.1.0)(@shikijs/themes@4.3.0)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(shiki@4.2.0)':
++  '@pierre/theming@1.0.0(@pierre/theme@1.1.0)(@shikijs/themes@4.2.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(shiki@4.2.0)':
+     optionalDependencies:
+       '@pierre/theme': 1.1.0
+-      '@shikijs/themes': 4.3.0
+-      react: 19.2.6
+-      react-dom: 19.2.6(react@19.2.6)
++      '@shikijs/themes': 4.2.0
++      react: 19.3.0
++      react-dom: 19.3.0(react@19.3.0)
+       shiki: 4.2.0
+ 
+-  '@pierre/theming@1.0.0(@pierre/theme@2.0.0)(@shikijs/themes@4.2.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(shiki@4.2.0)':
++  '@pierre/theming@1.0.0(@pierre/theme@2.0.0)(@shikijs/themes@4.3.0)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(shiki@4.2.0)':
+     optionalDependencies:
+       '@pierre/theme': 2.0.0
+-      '@shikijs/themes': 4.2.0
+-      react: 19.3.0
+-      react-dom: 19.3.0(react@19.3.0)
++      '@shikijs/themes': 4.3.0
++      react: 19.2.6
++      react-dom: 19.2.6(react@19.2.6)
+       shiki: 4.2.0
+ 
+   '@pierre/theming@1.0.1(@pierre/theme@2.0.0)(@shikijs/themes@4.2.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(shiki@4.2.0)':
+@@ -15864,25 +15864,25 @@ snapshots:
+       react-dom: 19.3.0(react@19.3.0)
+       shiki: 4.2.0
+ 
+-  '@pierre/trees@1.0.0-beta.6(@pierre/theme@1.1.0)(@shikijs/themes@4.3.0)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(shiki@4.2.0)':
++  '@pierre/trees@1.0.0-beta.6(@pierre/theme@1.1.0)(@shikijs/themes@4.2.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(shiki@4.2.0)':
+     dependencies:
+-      '@pierre/theming': 1.0.0(@pierre/theme@1.1.0)(@shikijs/themes@4.3.0)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(shiki@4.2.0)
++      '@pierre/theming': 1.0.0(@pierre/theme@1.1.0)(@shikijs/themes@4.2.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(shiki@4.2.0)
+       preact: 11.0.0-beta.0
+       preact-render-to-string: 6.6.5(preact@11.0.0-beta.0)
+-      react: 19.2.6
+-      react-dom: 19.2.6(react@19.2.6)
++      react: 19.3.0
++      react-dom: 19.3.0(react@19.3.0)
+     transitivePeerDependencies:
+       - '@pierre/theme'
+       - '@shikijs/themes'
+       - shiki
+ 
+-  '@pierre/trees@1.0.0-beta.6(@pierre/theme@2.0.0)(@shikijs/themes@4.2.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(shiki@4.2.0)':
++  '@pierre/trees@1.0.0-beta.6(@pierre/theme@2.0.0)(@shikijs/themes@4.3.0)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(shiki@4.2.0)':
+     dependencies:
+-      '@pierre/theming': 1.0.0(@pierre/theme@2.0.0)(@shikijs/themes@4.2.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(shiki@4.2.0)
++      '@pierre/theming': 1.0.0(@pierre/theme@2.0.0)(@shikijs/themes@4.3.0)(react-dom@19.2.6(react@19.2.6))(react@19.2.6)(shiki@4.2.0)
+       preact: 11.0.0-beta.0
+       preact-render-to-string: 6.6.5(preact@11.0.0-beta.0)
+-      react: 19.3.0
+-      react-dom: 19.3.0(react@19.3.0)
++      react: 19.2.6
++      react-dom: 19.2.6(react@19.2.6)
+     transitivePeerDependencies:
+       - '@pierre/theme'
+       - '@shikijs/themes'
+@@ -16308,7 +16308,7 @@ snapshots:
+   '@shikijs/types@4.2.0':
+     dependencies:
+       '@shikijs/vscode-textmate': 10.0.2
+-      '@types/hast': 3.0.4
++      '@types/hast': 3.0.5
+ 
+   '@shikijs/types@4.3.0':
+     dependencies:
+@@ -19590,10 +19590,6 @@ snapshots:
+     dependencies:
+       walk-up-path: 4.0.0
+ 
+-  fdir@6.5.0(picomatch@4.0.4):
+-    optionalDependencies:
+-      picomatch: 4.0.4
+-
+   fdir@6.5.0(picomatch@4.0.7):
+     optionalDependencies:
+       picomatch: 4.0.7
+@@ -22697,7 +22693,7 @@ snapshots:
+       '@shikijs/themes': 4.2.0
+       '@shikijs/types': 4.2.0
+       '@shikijs/vscode-textmate': 10.0.2
+-      '@types/hast': 3.0.4
++      '@types/hast': 3.0.5
+ 
+   should-equal@2.0.0:
+     dependencies:
+@@ -23045,8 +23041,8 @@ snapshots:
+ 
+   tinyglobby@0.2.17:
+     dependencies:
+-      fdir: 6.5.0(picomatch@4.0.4)
+-      picomatch: 4.0.4
++      fdir: 6.5.0(picomatch@4.0.7)
++      picomatch: 4.0.7
+ 
+   tinypool@2.1.2: {}
+ 
+diff --git a/pnpm-workspace.yaml b/pnpm-workspace.yaml
+index 807cc7379..c16266762 100644
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -144,7 +144,7 @@ minimumReleaseAgeExclude:
+   - expo-sqlite@58.0.8
+   - expo-symbols@58.0.3
+   - electron@44.4.5
+-  - "@anthropic-ai/claude-agent-sdk@0.3.276"
++  - "@anthropic-ai/claude-agent-sdk@0.3.301"
+   - "@alchemy.run/cloudflare-runtime@2.0.0-beta.80"
+   - "@alchemy.run/floci@2.0.0-beta.80"
+   - "@alchemy.run/node-utils@2.0.0-beta.80"
+-- 
+2.43.0
+

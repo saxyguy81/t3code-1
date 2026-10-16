@@ -1,7 +1,7 @@
 From eba37f233afc04e53b51df45adb653116e8caa8f Mon Sep 17 00:00:00 2001
 From: "Scott Hanan (t2 executor)" <t3exec@t2.tailc9b568.ts.net>
 Date: Fri, 16 Oct 2026 05:10:21 -0700
-Subject: [PATCH 04/12] fix(server): typecheck hub hold HTTP, legacy session
+Subject: [PATCH 04/13] fix(server): typecheck hub hold HTTP, legacy session
  stop, settings op (#303)
 
 - read the operator principal by yielding the service
