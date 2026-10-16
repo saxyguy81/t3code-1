@@ -32,3 +32,17 @@ Note: after a clear, threads whose queue is held (restart or recovery) still nee
 ## Identity note
 A source run reports version 0.0.45 (upstream stamps versions only at release build) and bundleSha256 null (no .mjs).
 The deploy build must run scripts/update-release-package-versions.ts so readbacks report 0.1.0 and a bundle sha.
+
+## (c) import of copied 0.0.45 state: PASS  (10-16 05:36-05:45 PT)
+Source: a scratch 0.0.45 hub (separate worktree at the live line's commit 639d1813c, scratch install, scratch home),
+never live state. Built with the same 0.0.x `POST /api/orchestration/dispatch` bodies the compat endpoint takes
+(so they are confirmed against real 0.0.45): project.create, 2 threads, 4 completed turns (ACP mock via a cursor
+binaryPath wrapper), one thread.meta.update rename. 0.0.45 settings.json had no continueThreadsAfterServerUpdate key.
+Copied the home (state.sqlite sha256 prefix 85de8efb7b5c3d17, unchanged after the run) and booted 0.1.0 on the copy:
+- settings.json now holds `continueThreadsAfterServerUpdate: false`; inventory readback `global: false`, no project overrides.
+- Both threads imported with titles (rename kept); both transcripts serve all user turns and assistant replies.
+- Inventory after import: all counts 0 (the v1 queue was empty; the import carries no v1 queued or in-flight turns).
+- First turn after import, sent through compat with modelSelection on an ACP mock instance: completed, one prompt,
+  and that prompt carried the prior turns' text (full-context handoff), delivered once.
+- Harness note: 0.1.0's cursor driver uses the Cursor Agent SDK, so a 0.0.45 cursor/ACP instance fails its first
+  turn on 0.1.0 with a visible failed run (not a silent loss). Threads must move to a 0.1.0 provider instance.

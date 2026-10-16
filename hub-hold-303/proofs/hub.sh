@@ -1,7 +1,7 @@
 #!/bin/bash
 # hub.sh init|start|stop|token  -- scratch 0.1.0 hub for hanan-work#303 proofs. HOME_DIR is throwaway.
 set -euo pipefail
-R=~/Projects/t3code-work/hub-hold-303
+R=${HUB_REPO:-$HOME/Projects/t3code-work/hub-hold-303}
 H=${HUB_HOME:-$HOME/work/hh303/proof/home}
 PORT=${HUB_PORT:-47303}
 UNIT=hh303-hub-$PORT
