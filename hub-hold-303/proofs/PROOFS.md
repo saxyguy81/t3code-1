@@ -46,3 +46,18 @@ Copied the home (state.sqlite sha256 prefix 85de8efb7b5c3d17, unchanged after th
   and that prompt carried the prior turns' text (full-context handoff), delivered once.
 - Harness note: 0.1.0's cursor driver uses the Cursor Agent SDK, so a 0.0.45 cursor/ACP instance fails its first
   turn on 0.1.0 with a visible failed run (not a silent loss). Threads must move to a 0.1.0 provider instance.
+
+## (c) router half: first post-import turn through the REAL t2 router: PASS  (10-16 05:49 PT)
+Fresh 0.1.0 import of the same 0.0.45 copy (home-c02). Claude instance (`claudeAgent`, the local claude CLI, scratch
+CLAUDE home, the t2 credential helper by path, consumer t3-t2) pointed at a loopback pass-through (`router-tap.mjs`) in
+front of the t2 router 127.0.0.1:18788; the tap records method/path/model/status/id headers only.
+First turn on imported thread pc-thread-1 via compat `thread.turn.start` (modelSelection claude / claude-sonnet-5-5),
+one small prompt ("Reply with exactly the word OK."):
+- T3 run completed; assistant reply "OK". The single user message the CLI sent carried both imported turns and their
+  replies plus the new prompt (full-context handoff).
+- The turn's request (from the CLI session log `requestId`): `req_011Cg5whckLTMkTwQxTihxR2`,
+  router `x-request-id 9776d140`, conversation `conv_efd750a5f19244eeb5cb25ae373650e1`, HTTP **200**.
+- Router replica (as_of 05:52:03 PT): that conversation has **1** turn_request (`request_94e4a425f0c5414e8afd05eb06fbc982`),
+  state succeeded, commit visible_output, **1** attempt, dispatch_ordinal 0, 0 attempt_failures. No 409 anywhere in the tap.
+- The tap also saw one CLI-internal side call (`req_011Cg5whZuvSA8XrFpacuahx`, conv_e5402332…, 200, 1 attempt; not part
+  of the session transcript) and two `HEAD /api/hello` 404 probes from the CLI.
