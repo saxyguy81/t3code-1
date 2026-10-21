@@ -14,6 +14,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as SqlClient from "effect/sql/SqlClient";
 import * as Etag from "effect/http/Etag";
 import * as HttpPlatform from "effect/http/HttpPlatform";
 import * as HttpRouter from "effect/http/HttpRouter";
@@ -58,11 +59,20 @@ const layerConfig = Layer.effect(
   }),
 ).pipe(Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-auth-renew-http-" })));
 
+// Lets a test break the database under the running routes.
+const database: { run?: (statement: string) => Promise<unknown> } = {};
+const layerDatabaseHandle = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const sql = yield* SqlClient.SqlClient;
+    database.run = (statement) => Effect.runPromise(sql.unsafe(statement));
+  }),
+);
+
 const layerRoutes = HttpApiBuilder.layer(AuthTestApi).pipe(
   Layer.provide(AuthHttp.layer),
   Layer.provide(AuthHttp.layerAuthenticatedAuth),
   Layer.provideMerge(
-    EnvironmentAuth.layer.pipe(
+    Layer.merge(EnvironmentAuth.layer, layerDatabaseHandle).pipe(
       Layer.provide(SqlitePersistence.layerMemory),
       Layer.provide(ServerSecretStore.layer),
       Layer.provide(ServerEnvironment.layerIdentity),
@@ -245,5 +255,32 @@ it.effect("POST /api/auth/session/renew gives a phone bearer client a later toke
 
     const unauthenticated = await handler(postEmpty("/api/auth/session/renew"));
     expect(unauthenticated.status).toBe(401);
+  }),
+);
+
+// A renewal that fails inside the server must not turn a valid session read
+// into a 500.
+it.effect("GET /api/auth/session still answers when renewing the cookie fails", () =>
+  withRoutes(async (handler, issueCredential) => {
+    const created = await handler(
+      postJson("/api/auth/browser-session", { credential: await issueCredential() }),
+    );
+    const cookie = created.headers.getSetCookie()[0]?.split(";", 1)[0] ?? "";
+
+    await database.run?.(
+      `CREATE TRIGGER fail_session_renewal BEFORE UPDATE OF expires_at ON auth_sessions
+       BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END`,
+    );
+    clockOffset.ms = Duration.toMillis(Duration.days(29));
+    const response = await handler(
+      new Request("http://127.0.0.1/api/auth/session", { headers: { cookie } }),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ authenticated: true });
+    expect(response.headers.getSetCookie()).toEqual([]);
+
+    // The explicit renew route still reports the failure.
+    const renewed = await handler(postEmpty("/api/auth/session/renew", { cookie }));
+    expect(renewed.status).toBe(500);
   }),
 );

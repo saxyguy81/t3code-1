@@ -2,6 +2,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { type AuthSessionId, AuthStandardClientScopes, EnvironmentId } from "@t3tools/contracts";
 import { assert, expect, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -11,6 +12,8 @@ import * as TestClock from "effect/testing/TestClock";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as AuthSessions from "../persistence/AuthSessions.ts";
+import type { AuthSessionRepositoryError } from "../persistence/Errors.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as SessionStore from "./SessionStore.ts";
 import * as ServerSecretStore from "./ServerSecretStore.ts";
@@ -26,6 +29,47 @@ const layerSessionStore = SessionStore.layer.pipe(
   Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-auth-renewal-test-" })),
 );
 const layerTest = Layer.merge(layerSessionStore, TestClock.layer());
+
+// Runs another writer's change just before the next renewal UPDATE, so that
+// renewal loses its optimistic check the way a concurrent request would.
+const race: {
+  before?:
+    | ((
+        repository: AuthSessions.AuthSessionRepository["Service"],
+        input: AuthSessions.RenewAuthSessionInput,
+      ) => Effect.Effect<unknown, AuthSessionRepositoryError>)
+    | undefined;
+} = {};
+const layerRacingRepository = Layer.effect(
+  AuthSessions.AuthSessionRepository,
+  Effect.gen(function* () {
+    const repository = yield* AuthSessions.AuthSessionRepository;
+    return AuthSessions.AuthSessionRepository.of({
+      ...repository,
+      renew: (input) => {
+        const before = race.before;
+        race.before = undefined;
+        return (before ? before(repository, input) : Effect.void).pipe(
+          Effect.andThen(repository.renew(input)),
+        );
+      },
+    });
+  }),
+).pipe(Layer.provide(AuthSessions.layer));
+const layerRacingTest = Layer.merge(
+  Layer.effect(SessionStore.SessionStore, SessionStore.make).pipe(
+    Layer.provideMerge(layerRacingRepository),
+    Layer.provide(SqlitePersistence.layerMemory),
+    Layer.provide(ServerSecretStore.layer),
+    Layer.provide(
+      Layer.succeed(ServerEnvironment.ServerEnvironmentIdentity, {
+        getEnvironmentId: Effect.succeed(EnvironmentId.make("test-environment")),
+      }),
+    ),
+    Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-auth-renewal-race-" })),
+  ),
+  TestClock.layer(),
+);
 
 // The row a phone gets from pairing: a bearer token exchanged for a one-time code.
 const phoneSession = {
@@ -248,6 +292,76 @@ it.layer(NodeServices.layer)("SessionStore renewal", (it) => {
       const relayRenewal = yield* sessions.renew(relay.token);
       assert(!relayRenewal.renewed);
       expect(relayRenewal.reason).toBe("not_renewable");
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("a renewal that loses the race hands out the winner's token, never a second extension", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue(phoneSession);
+      yield* TestClock.adjust(Duration.days(29));
+
+      let winnerExpiresAtMs: number | undefined;
+      race.before = (repository, input) => {
+        winnerExpiresAtMs = input.expiresAt.epochMilliseconds;
+        return repository.renew(input);
+      };
+      const loser = yield* renewOrFail(sessions, issued.token);
+      expect(race.before).toBeUndefined();
+      expect(loser.sessionId).toBe(issued.sessionId);
+      expect(loser.expiresAt.epochMilliseconds).toBe(winnerExpiresAtMs);
+      expect((yield* sessions.verify(loser.token)).sessionId).toBe(issued.sessionId);
+      const [listed] = yield* sessions.listActive();
+      expect(listed?.expiresAt.epochMilliseconds).toBe(winnerExpiresAtMs);
+    }).pipe(Effect.provide(layerRacingTest)),
+  );
+
+  it.effect("a renewal that loses to a revoke fails as revoked", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const issued = yield* sessions.issue(phoneSession);
+      yield* TestClock.adjust(Duration.days(29));
+
+      race.before = (repository, input) =>
+        repository.revoke({ sessionId: input.sessionId, revokedAt: input.renewedAt });
+      expect((yield* Effect.flip(sessions.renew(issued.token)))._tag).toBe(
+        "SessionTokenRevokedError",
+      );
+      expect(yield* sessions.listActive()).toEqual([]);
+    }).pipe(Effect.provide(layerRacingTest)),
+  );
+
+  it.effect("after two renewals only the token replaced last gets the grace window", () =>
+    Effect.gen(function* () {
+      const sessions = yield* SessionStore.SessionStore;
+      const repository = yield* AuthSessions.AuthSessionRepository;
+      const issued = yield* sessions.issue(phoneSession);
+      yield* TestClock.adjust(Duration.days(29));
+      const second = yield* renewOrFail(sessions, issued.token);
+
+      // A second renewal lands a minute later (as one under a shorter
+      // lifetime could), while the first token has not expired by its own claim.
+      yield* TestClock.adjust(Duration.minutes(1));
+      const row = yield* repository.getById({ sessionId: issued.sessionId });
+      assert(row._tag === "Some");
+      const now = yield* Clock.currentTimeMillis;
+      expect(
+        yield* repository.renew({
+          sessionId: issued.sessionId,
+          previousExpiresAt: row.value.expiresAt,
+          previousRenewedAt: row.value.renewedAt,
+          expiresAt: DateTime.makeUnsafe(row.value.expiresAt.epochMilliseconds + 60_000),
+          renewedAt: DateTime.makeUnsafe(now),
+        }),
+      ).toBe(true);
+
+      expect((yield* Effect.flip(sessions.verify(issued.token)))._tag).toBe(
+        "SessionTokenSupersededError",
+      );
+      expect((yield* Effect.flip(sessions.renew(issued.token)))._tag).toBe(
+        "SessionTokenSupersededError",
+      );
+      expect((yield* sessions.verify(second.token)).sessionId).toBe(issued.sessionId);
     }).pipe(Effect.provide(layerTest)),
   );
 });

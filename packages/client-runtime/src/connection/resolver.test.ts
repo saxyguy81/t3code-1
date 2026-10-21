@@ -5,6 +5,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -67,6 +68,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly descriptorProtocolVersion?: number | null | undefined;
   readonly renewSession?: (request: Request) => Response;
   readonly onCredentialPut?: (connectionId: string, credential: ConnectionCredential) => void;
+  readonly failCredentialPut?: () => boolean;
 }) => {
   const profiles = new Map(
     (options?.profiles ?? []).map((profile) => [profile.connectionId, profile]),
@@ -81,10 +83,14 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   const credentialStore = ConnectionCredentialStore.ConnectionCredentialStore.of({
     get: (connectionId) => Effect.succeed(Option.fromNullishOr(credentials.get(connectionId))),
     put: (connectionId, credential) =>
-      Effect.sync(() => {
-        options?.onCredentialPut?.(connectionId, credential);
-        credentials.set(connectionId, credential);
-      }),
+      options?.failCredentialPut?.()
+        ? Effect.fail(
+            new ConnectionTransientError({ reason: "transport", detail: "keychain is locked" }),
+          )
+        : Effect.sync(() => {
+            options?.onCredentialPut?.(connectionId, credential);
+            credentials.set(connectionId, credential);
+          }),
     remove: (connectionId) => Effect.sync(() => void credentials.delete(connectionId)),
   });
   const remote = RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization.of({
@@ -300,8 +306,191 @@ describe("ConnectionResolver", () => {
       // A failed renewal never blocks the connection.
       renewal = {};
       yield* TestClock.adjust("2 hours");
-      const afterFailure = yield* resolver.prepare(entry);
+      const failing = yield* resolver.prepare(entry).pipe(Effect.forkChild);
+      yield* TestClock.adjust("1 minute");
+      const afterFailure = yield* Fiber.join(failing);
       expect(afterFailure.httpAuthorization).toEqual({ _tag: "Bearer", token: "renewed-again" });
+    }),
+  );
+
+  // A lost answer must be retried inside the server's 10-minute grace
+  // window, not an hour or a day later.
+  it.effect("retries a renewal whose answer was lost and stores the re-delivered token", () =>
+    Effect.gen(function* () {
+      const renewCalls: Array<string | null> = [];
+      const authorized: Array<string> = [];
+      const stored: Array<string> = [];
+      const target = new BearerConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Phone",
+        connectionId: "saved-1",
+      });
+      const profile = new BearerConnectionProfile({
+        connectionId: "saved-1",
+        environmentId: ENVIRONMENT_ID,
+        label: "Phone",
+        httpBaseUrl: ENDPOINT.httpBaseUrl,
+        wsBaseUrl: ENDPOINT.wsBaseUrl,
+      });
+      const layerBroker = yield* makeDependencies({
+        credentials: [["saved-1", new BearerConnectionCredential({ token: "old-bearer" })]],
+        onCredentialPut: (_connectionId, credential) => stored.push(credential.token),
+        // The server commits the renewal, but its first answer never arrives.
+        renewSession: (request) => {
+          renewCalls.push(request.headers.get("authorization"));
+          return renewCalls.length === 1
+            ? Response.json({ code: "unavailable" }, { status: 503 })
+            : Response.json({
+                renewed: true,
+                expiresAt: "2026-12-20T00:00:00.000Z",
+                access_token: "redelivered-bearer",
+              });
+        },
+        authorizeBearer: (input) =>
+          Effect.sync(() => authorized.push(input.bearerToken)).pipe(
+            Effect.as({
+              environmentId: input.expectedEnvironmentId,
+              label: "Phone",
+              httpBaseUrl: input.httpBaseUrl,
+              socketUrl: "wss://environment.example.test/ws?wsTicket=ticket",
+              httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+            }),
+          ),
+      });
+      const resolver = yield* ConnectionResolver.ConnectionResolver.pipe(
+        Effect.provide(layerBroker),
+      );
+      const entry = catalogEntry(target, Option.some(profile));
+
+      const connecting = yield* resolver.prepare(entry).pipe(Effect.forkChild);
+      // Well inside the grace window.
+      yield* TestClock.adjust("1 minute");
+      const prepared = yield* Fiber.join(connecting);
+
+      expect(renewCalls).toEqual(["Bearer old-bearer", "Bearer old-bearer"]);
+      expect(authorized).toEqual(["redelivered-bearer"]);
+      expect(prepared.httpAuthorization).toEqual({ _tag: "Bearer", token: "redelivered-bearer" });
+      expect(stored).toEqual(["redelivered-bearer"]);
+    }),
+  );
+
+  it.effect("asks again on the next connect when every retry of a renewal failed", () =>
+    Effect.gen(function* () {
+      let available = false;
+      const renewCalls: Array<string | null> = [];
+      const target = new BearerConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Phone",
+        connectionId: "saved-1",
+      });
+      const profile = new BearerConnectionProfile({
+        connectionId: "saved-1",
+        environmentId: ENVIRONMENT_ID,
+        label: "Phone",
+        httpBaseUrl: ENDPOINT.httpBaseUrl,
+        wsBaseUrl: ENDPOINT.wsBaseUrl,
+      });
+      const layerBroker = yield* makeDependencies({
+        credentials: [["saved-1", new BearerConnectionCredential({ token: "old-bearer" })]],
+        renewSession: (request) => {
+          renewCalls.push(request.headers.get("authorization"));
+          return available
+            ? Response.json({
+                renewed: true,
+                expiresAt: "2026-12-20T00:00:00.000Z",
+                access_token: "redelivered-bearer",
+              })
+            : Response.json({ code: "unavailable" }, { status: 503 });
+        },
+      });
+      const resolver = yield* ConnectionResolver.ConnectionResolver.pipe(
+        Effect.provide(layerBroker),
+      );
+      const entry = catalogEntry(target, Option.some(profile));
+
+      const first = yield* resolver.prepare(entry).pipe(Effect.forkChild);
+      yield* TestClock.adjust("1 minute");
+      expect((yield* Fiber.join(first)).httpAuthorization).toEqual({
+        _tag: "Bearer",
+        token: "old-bearer",
+      });
+      const failedCalls = renewCalls.length;
+      expect(failedCalls).toBeGreaterThan(1);
+
+      // A reconnect a few minutes later is not held back by the hourly limit.
+      available = true;
+      yield* TestClock.adjust("3 minutes");
+      const second = yield* resolver.prepare(entry);
+      expect(renewCalls).toHaveLength(failedCalls + 1);
+      expect(second.httpAuthorization).toEqual({ _tag: "Bearer", token: "redelivered-bearer" });
+    }),
+  );
+
+  // A renewed token the store refused must keep being used,
+  // since the stored token it replaced dies when the grace window ends.
+  it.effect("keeps using a renewed token the credential store refused, and stores it later", () =>
+    Effect.gen(function* () {
+      let putFails = true;
+      const renewCalls: Array<string | null> = [];
+      const authorized: Array<string> = [];
+      const stored: Array<string> = [];
+      const target = new BearerConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Phone",
+        connectionId: "saved-1",
+      });
+      const profile = new BearerConnectionProfile({
+        connectionId: "saved-1",
+        environmentId: ENVIRONMENT_ID,
+        label: "Phone",
+        httpBaseUrl: ENDPOINT.httpBaseUrl,
+        wsBaseUrl: ENDPOINT.wsBaseUrl,
+      });
+      const layerBroker = yield* makeDependencies({
+        credentials: [["saved-1", new BearerConnectionCredential({ token: "old-bearer" })]],
+        failCredentialPut: () => putFails,
+        onCredentialPut: (_connectionId, credential) => stored.push(credential.token),
+        renewSession: (request) => {
+          renewCalls.push(request.headers.get("authorization"));
+          return Response.json({
+            renewed: true,
+            expiresAt: "2026-12-20T00:00:00.000Z",
+            access_token: "renewed-bearer",
+          });
+        },
+        authorizeBearer: (input) =>
+          Effect.sync(() => authorized.push(input.bearerToken)).pipe(
+            Effect.as({
+              environmentId: input.expectedEnvironmentId,
+              label: "Phone",
+              httpBaseUrl: input.httpBaseUrl,
+              socketUrl: "wss://environment.example.test/ws?wsTicket=ticket",
+              httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+            }),
+          ),
+      });
+      const resolver = yield* ConnectionResolver.ConnectionResolver.pipe(
+        Effect.provide(layerBroker),
+      );
+      const entry = catalogEntry(target, Option.some(profile));
+
+      const first = yield* resolver.prepare(entry);
+      expect(first.httpAuthorization).toEqual({ _tag: "Bearer", token: "renewed-bearer" });
+
+      // Past the grace window, a reconnect still uses the renewed token, and
+      // the daily check of the live connection does not fall back either.
+      yield* TestClock.adjust("15 minutes");
+      const reconnected = yield* resolver.prepare(entry);
+      expect(reconnected.httpAuthorization).toEqual({ _tag: "Bearer", token: "renewed-bearer" });
+      expect(yield* resolver.renewCredential(reconnected)).toEqual(Option.none());
+      expect(authorized).toEqual(["renewed-bearer", "renewed-bearer"]);
+      expect(renewCalls).toEqual(["Bearer old-bearer"]);
+
+      // Once the store works again the renewed token is saved.
+      putFails = false;
+      expect(stored).toEqual([]);
+      yield* resolver.prepare(entry);
+      expect(stored).toEqual(["renewed-bearer"]);
     }),
   );
 
