@@ -61,6 +61,24 @@ export interface VerifiedSession {
   readonly runtimeModeCeiling?: RuntimeMode;
 }
 
+/**
+ * Why a renewal left the session as it was: it is not near expiry yet, it
+ * reached the absolute lifetime cap, or its kind never renews (proof-bound
+ * T3 Connect tokens re-exchange instead, and the reusable dev token is fixed).
+ */
+export type SessionRenewalRefusal = "not_due" | "max_lifetime" | "not_renewable";
+
+export type SessionRenewal =
+  | {
+      readonly renewed: true;
+      readonly session: IssuedSession;
+    }
+  | {
+      readonly renewed: false;
+      readonly reason: SessionRenewalRefusal;
+      readonly expiresAt: DateTime.DateTime;
+    };
+
 export type SessionCredentialChange =
   | {
       readonly type: "clientUpserted";
@@ -133,6 +151,17 @@ export class SessionTokenRevokedError extends Schema.TaggedError<SessionTokenRev
 ) {
   override get message(): string {
     return "Session token revoked.";
+  }
+}
+
+export class SessionTokenSupersededError extends Schema.TaggedError<SessionTokenSupersededError>()(
+  "SessionTokenSupersededError",
+  {
+    sessionId: AuthSessionId,
+  },
+) {
+  override get message(): string {
+    return "Session token was replaced by a renewal.";
   }
 }
 
@@ -233,6 +262,7 @@ export const SessionCredentialInvalidError = Schema.Union([
   SessionTokenExpiredError,
   UnknownSessionTokenError,
   SessionTokenRevokedError,
+  SessionTokenSupersededError,
   InvalidSessionExpirationClaimError,
   MalformedWebSocketTokenError,
   InvalidWebSocketTokenSignatureError,
@@ -380,6 +410,13 @@ export class SessionStore extends Context.Service<
       readonly replaceSessionId?: AuthSessionId;
     }) => Effect.Effect<IssuedSession, SessionCredentialInternalError>;
     readonly verify: (token: string) => Effect.Effect<VerifiedSession, SessionCredentialError>;
+    /**
+     * Extends the session behind a valid token, keeping its id, once it is
+     * near expiry. The token it replaces keeps working for a short grace
+     * window, and presenting that token again within the window re-delivers
+     * the renewed one.
+     */
+    readonly renew: (token: string) => Effect.Effect<SessionRenewal, SessionCredentialError>;
     readonly issueWebSocketToken: (
       sessionId: AuthSessionId,
       input?: {
@@ -424,6 +461,16 @@ export class SessionStore extends Context.Service<
 const SIGNING_SECRET_NAME = "server-signing-key";
 const DEFAULT_SESSION_TTL = Duration.days(30);
 const DEFAULT_WEBSOCKET_TOKEN_TTL = Duration.minutes(5);
+// A session renews in the last quarter of its token lifetime, and never more
+// than 7 days early, so a 30-day session renews in its last week.
+const SESSION_RENEWAL_WINDOW_MS = Duration.toMillis(Duration.days(7));
+const SESSION_RENEWAL_WINDOW_FRACTION = 0.25;
+// Renewals never carry a session past this age; then it must pair again.
+const SESSION_MAX_LIFETIME_MS = Duration.toMillis(Duration.days(180));
+// How long a replaced token keeps working: long enough for requests already
+// in flight and for a client to retry a renewal whose answer it lost, short
+// enough that a copy of the old token dies soon after the client moves on.
+const SESSION_RENEWAL_GRACE_MS = Duration.toMillis(Duration.minutes(10));
 
 const SessionClaims = Schema.Struct({
   v: Schema.Literals([1, 2]),
@@ -650,6 +697,24 @@ const make = Effect.gen(function* () {
     );
 
   const encodeClaims = Schema.encodeEffect(Schema.fromJsonString(SessionClaims));
+  const signSessionClaims = (claims: SessionClaims) =>
+    encodeClaims(claims).pipe(
+      Effect.map(base64UrlEncode),
+      Effect.map(
+        (encodedPayload) => `${encodedPayload}.${signPayload(encodedPayload, signingSecret)}`,
+      ),
+      Effect.mapError(
+        (cause) =>
+          new SessionCredentialIssueError({
+            sessionId: claims.sid,
+            cause: new SessionClaimsEncodingError({
+              sessionId: claims.sid,
+              operation: "encode_session_claims",
+              cause,
+            }),
+          }),
+      ),
+    );
   const issue: SessionStore["Service"]["issue"] = Effect.fn("SessionStore.issue")(
     function* (input) {
       const sessionId = AuthSessionId.make(
@@ -674,21 +739,7 @@ const make = Effect.gen(function* () {
         exp: expiresAt.epochMilliseconds,
       };
 
-      const encodedPayload = yield* encodeClaims(claims).pipe(
-        Effect.map(base64UrlEncode),
-        Effect.mapError(
-          (cause) =>
-            new SessionCredentialIssueError({
-              sessionId,
-              cause: new SessionClaimsEncodingError({
-                sessionId,
-                operation: "encode_session_claims",
-                cause,
-              }),
-            }),
-        ),
-      );
-      const signature = signPayload(encodedPayload, signingSecret);
+      const token = yield* signSessionClaims(claims);
       const client = input?.client ?? createDefaultClientMetadata();
       const sessionRecord = {
         sessionId,
@@ -746,7 +797,7 @@ const make = Effect.gen(function* () {
 
       return {
         sessionId,
-        token: `${encodedPayload}.${signature}`,
+        token,
         method: claims.method,
         client,
         expiresAt: expiresAt,
@@ -755,6 +806,70 @@ const make = Effect.gen(function* () {
       } satisfies IssuedSession;
     },
   );
+
+  const verifySignedSessionToken = Effect.fnUntraced(function* (token: string) {
+    const [encodedPayload, signature] = token.split(".");
+    if (!encodedPayload || !signature) {
+      return yield* new MalformedSessionTokenError({});
+    }
+
+    const expectedSignature = signPayload(encodedPayload, signingSecret);
+    if (!timingSafeEqualBase64Url(signature, expectedSignature)) {
+      return yield* new InvalidSessionTokenSignatureError({});
+    }
+
+    const claims = yield* decodeSessionClaims(base64UrlDecodeUtf8(encodedPayload)).pipe(
+      Effect.mapError((cause) => new InvalidSessionTokenPayloadError({ cause })),
+    );
+
+    const observedAt = yield* DateTime.now;
+    const expiresAt = DateTime.make(claims.exp);
+    if (Option.isNone(expiresAt)) {
+      return yield* new InvalidSessionExpirationClaimError({
+        sessionId: claims.sid,
+        expirationClaim: claims.exp,
+      });
+    }
+    if (claims.exp <= observedAt.epochMilliseconds) {
+      return yield* new SessionTokenExpiredError({
+        sessionId: claims.sid,
+        expiresAt: expiresAt.value,
+        observedAt,
+      });
+    }
+
+    const row = yield* authSessions
+      .getById({ sessionId: claims.sid })
+      .pipe(
+        Effect.mapError(
+          (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
+        ),
+      );
+    if (Option.isNone(row)) {
+      return yield* new UnknownSessionTokenError({ sessionId: claims.sid });
+    }
+    if (row.value.revokedAt !== null) {
+      return yield* new SessionTokenRevokedError({
+        sessionId: claims.sid,
+        revokedAt: row.value.revokedAt,
+      });
+    }
+    // A token older than the session's current expiry was replaced by a
+    // renewal. Only the one it replaced last still works, and only briefly.
+    const superseded = claims.exp < row.value.expiresAt.epochMilliseconds;
+    if (
+      superseded &&
+      (row.value.renewedAt === null ||
+        row.value.previousExpiresAt === null ||
+        claims.exp < row.value.previousExpiresAt.epochMilliseconds ||
+        observedAt.epochMilliseconds >=
+          row.value.renewedAt.epochMilliseconds + SESSION_RENEWAL_GRACE_MS)
+    ) {
+      return yield* new SessionTokenSupersededError({ sessionId: claims.sid });
+    }
+
+    return { claims, row: row.value, expiresAt: expiresAt.value, observedAt, superseded };
+  });
 
   const verify: SessionStore["Service"]["verify"] = Effect.fn("SessionStore.verify")(
     function* (token) {
@@ -794,64 +909,102 @@ const make = Effect.gen(function* () {
           scopes: row.value.scopes,
         } satisfies VerifiedSession;
       }
-      const [encodedPayload, signature] = token.split(".");
-      if (!encodedPayload || !signature) {
-        return yield* new MalformedSessionTokenError({});
-      }
-
-      const expectedSignature = signPayload(encodedPayload, signingSecret);
-      if (!timingSafeEqualBase64Url(signature, expectedSignature)) {
-        return yield* new InvalidSessionTokenSignatureError({});
-      }
-
-      const claims = yield* decodeSessionClaims(base64UrlDecodeUtf8(encodedPayload)).pipe(
-        Effect.mapError((cause) => new InvalidSessionTokenPayloadError({ cause })),
-      );
-
-      const observedAt = yield* DateTime.now;
-      const expiresAt = DateTime.make(claims.exp);
-      if (Option.isNone(expiresAt)) {
-        return yield* new InvalidSessionExpirationClaimError({
-          sessionId: claims.sid,
-          expirationClaim: claims.exp,
-        });
-      }
-      if (claims.exp <= observedAt.epochMilliseconds) {
-        return yield* new SessionTokenExpiredError({
-          sessionId: claims.sid,
-          expiresAt: expiresAt.value,
-          observedAt,
-        });
-      }
-
-      const row = yield* authSessions
-        .getById({ sessionId: claims.sid })
-        .pipe(
-          Effect.mapError(
-            (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
-          ),
-        );
-      if (Option.isNone(row)) {
-        return yield* new UnknownSessionTokenError({ sessionId: claims.sid });
-      }
-      if (row.value.revokedAt !== null) {
-        return yield* new SessionTokenRevokedError({
-          sessionId: claims.sid,
-          revokedAt: row.value.revokedAt,
-        });
-      }
-
+      const { claims, row, expiresAt } = yield* verifySignedSessionToken(token);
       return {
         sessionId: claims.sid,
         token,
         method: claims.method,
-        client: toClientMetadata(row.value.client),
-        expiresAt: expiresAt.value,
+        client: toClientMetadata(row.client),
+        expiresAt,
         subject: claims.sub,
         scopes: claims.scopes,
         ...(claims.jkt ? { proofKeyThumbprint: claims.jkt } : {}),
         ...(claims.rtc ? { runtimeModeCeiling: claims.rtc } : {}),
       } satisfies VerifiedSession;
+    },
+  );
+
+  const renew: SessionStore["Service"]["renew"] = Effect.fn("SessionStore.renew")(
+    function* (token) {
+      if (devAuth?.matches(token)) {
+        const session = yield* verify(token);
+        return {
+          renewed: false,
+          reason: "not_renewable",
+          expiresAt: session.expiresAt ?? REUSABLE_DEV_SESSION_EXPIRES_AT,
+        };
+      }
+      const { claims, row, observedAt, superseded } = yield* verifySignedSessionToken(token);
+      if (claims.method === "dpop-access-token" || claims.jkt !== undefined) {
+        return { renewed: false, reason: "not_renewable", expiresAt: row.expiresAt };
+      }
+      const issueRenewedToken = (expiresAtMs: number) =>
+        signSessionClaims({ ...claims, iat: observedAt.epochMilliseconds, exp: expiresAtMs }).pipe(
+          Effect.map((renewedToken): SessionRenewal => ({
+            renewed: true,
+            session: {
+              sessionId: claims.sid,
+              token: renewedToken,
+              method: claims.method,
+              client: toClientMetadata(row.client),
+              expiresAt: DateTime.makeUnsafe(expiresAtMs),
+              scopes: claims.scopes,
+            },
+          })),
+        );
+      // The client never stored the renewed token (its answer was lost), so
+      // hand it the current one again rather than extending twice.
+      if (superseded) {
+        return yield* issueRenewedToken(row.expiresAt.epochMilliseconds);
+      }
+
+      const tokenLifetimeMs = claims.exp - claims.iat;
+      const remainingMs = row.expiresAt.epochMilliseconds - observedAt.epochMilliseconds;
+      if (
+        remainingMs >=
+        Math.min(SESSION_RENEWAL_WINDOW_MS, tokenLifetimeMs * SESSION_RENEWAL_WINDOW_FRACTION)
+      ) {
+        return { renewed: false, reason: "not_due", expiresAt: row.expiresAt };
+      }
+      const nextExpiresAtMs = Math.min(
+        observedAt.epochMilliseconds + tokenLifetimeMs,
+        row.issuedAt.epochMilliseconds + SESSION_MAX_LIFETIME_MS,
+      );
+      if (nextExpiresAtMs <= row.expiresAt.epochMilliseconds) {
+        return { renewed: false, reason: "max_lifetime", expiresAt: row.expiresAt };
+      }
+
+      const updated = yield* authSessions
+        .renew({
+          sessionId: claims.sid,
+          previousExpiresAt: row.expiresAt,
+          previousRenewedAt: row.renewedAt,
+          expiresAt: DateTime.makeUnsafe(nextExpiresAtMs),
+          renewedAt: observedAt,
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) => new SessionCredentialIssueError({ sessionId: claims.sid, cause }),
+          ),
+        );
+      // A concurrent renewal or revocation changed the row first; answer from
+      // its new state, where this token is superseded (or verify fails).
+      if (!updated) {
+        const current = yield* verifySignedSessionToken(token);
+        return current.superseded
+          ? yield* issueRenewedToken(current.row.expiresAt.epochMilliseconds)
+          : ({ renewed: false, reason: "not_due", expiresAt: current.row.expiresAt } as const);
+      }
+      const renewal = yield* issueRenewedToken(nextExpiresAtMs);
+      const listed = yield* loadActiveSession(claims.sid).pipe(
+        Effect.mapError(
+          (cause) => new SessionCredentialVerificationError({ sessionId: claims.sid, cause }),
+        ),
+      );
+      if (Option.isSome(listed)) {
+        yield* emitUpsert(listed.value);
+      }
+      return renewal;
     },
   );
 
@@ -1048,26 +1201,33 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         // Subscribe before reading: revocation can race with the WebSocket upgrade.
         const subscription = yield* PubSub.subscribe(changesPubSub);
-        const row = yield* authSessions
-          .getById({ sessionId })
-          .pipe(
-            Effect.mapError(
-              (cause) => new SessionCredentialVerificationError({ sessionId, cause }),
-            ),
-          );
-        if (Option.isNone(row) || row.value.revokedAt !== null) return;
-        const now = yield* DateTime.now;
-        const remaining = row.value.expiresAt.epochMilliseconds - now.epochMilliseconds;
-        if (remaining <= 0) return;
-        yield* Effect.raceFirst(
-          Stream.fromSubscription(subscription).pipe(
-            Stream.filter(
-              (change) => change.type === "clientRemoved" && change.sessionId === sessionId,
-            ),
-            Stream.runHead,
+        const removed = Stream.fromSubscription(subscription).pipe(
+          Stream.filter(
+            (change) => change.type === "clientRemoved" && change.sessionId === sessionId,
           ),
-          Effect.sleep(Duration.millis(remaining)),
+          Stream.runHead,
+          Effect.as(true),
         );
+        // A renewal moves the expiry forward, so the deadline is read again
+        // each time it passes.
+        for (;;) {
+          const row = yield* authSessions
+            .getById({ sessionId })
+            .pipe(
+              Effect.mapError(
+                (cause) => new SessionCredentialVerificationError({ sessionId, cause }),
+              ),
+            );
+          if (Option.isNone(row) || row.value.revokedAt !== null) return;
+          const now = yield* DateTime.now;
+          const remaining = row.value.expiresAt.epochMilliseconds - now.epochMilliseconds;
+          if (remaining <= 0) return;
+          const invalidated = yield* Effect.raceFirst(
+            removed,
+            Effect.sleep(Duration.millis(remaining)).pipe(Effect.as(false)),
+          );
+          if (invalidated) return;
+        }
       }),
     );
   });
@@ -1077,6 +1237,7 @@ const make = Effect.gen(function* () {
     legacyCookieName,
     issue,
     verify,
+    renew,
     issueWebSocketToken,
     verifyWebSocketToken,
     listActive,

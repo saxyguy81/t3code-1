@@ -52,6 +52,10 @@ const BETTER_ROUTE_CHECK_INTERVAL = "60 seconds";
 // A better route that answered the check but then failed to connect is not
 // tried again for this long, so a flaky LAN cannot bounce the connection.
 const BETTER_ROUTE_COOLDOWN_MS = 300_000;
+// A live socket can outlast its session's expiry, so a connected bearer
+// session asks the server to renew it daily; the server renews only when it is
+// near expiry. Reconnects renew too.
+const CREDENTIAL_RENEWAL_INTERVAL = "1 day";
 
 interface SupervisorIntent {
   readonly desired: boolean;
@@ -584,6 +588,30 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     }
   };
 
+  // The socket keeps the session it opened with; only the HTTP credential the
+  // connection's requests use moves to the renewed token.
+  const renewConnectedCredential = SubscriptionRef.get(prepared).pipe(
+    Effect.flatMap(
+      Option.match({
+        onNone: () => Effect.void,
+        onSome: (current) =>
+          driver.renewCredential(current).pipe(
+            Effect.flatMap(
+              Option.match({
+                onNone: () => Effect.void,
+                onSome: (renewed) =>
+                  SubscriptionRef.updateSome(prepared, (latest) =>
+                    Option.isSome(latest) && latest.value === current
+                      ? Option.some(Option.some(renewed))
+                      : Option.none(),
+                  ),
+              }),
+            ),
+          ),
+      }),
+    ),
+  );
+
   // Returning to the app, an explicit retry, and the network reporting offline
   // all probe the live session instead of replacing it, so a healthy socket is
   // not torn down (the offline report is often wrong, for example for a
@@ -603,6 +631,11 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     yield* Stream.tick(BETTER_ROUTE_CHECK_INTERVAL).pipe(
       Stream.drop(1),
       Stream.runForEach(() => requestBetterRouteCheck(lease)),
+      Effect.forkScoped,
+    );
+    yield* Stream.tick(CREDENTIAL_RENEWAL_INTERVAL).pipe(
+      Stream.drop(1),
+      Stream.runForEach(() => renewConnectedCredential),
       Effect.forkScoped,
     );
     for (;;) {

@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import type * as Option from "effect/Option";
 import * as Scope from "effect/Scope";
 import * as HttpClient from "effect/http/HttpClient";
 
@@ -57,6 +58,10 @@ export class ConnectionDriver extends Context.Service<
       entry: ConnectionCatalogEntry,
       route: ConnectionRoute,
     ) => Effect.Effect<boolean>;
+    /** Renews a live connection's bearer session; the connection with its new token, if any. */
+    readonly renewCredential: (
+      prepared: PreparedConnection,
+    ) => Effect.Effect<Option.Option<PreparedConnection>>;
   }
 >()("@t3tools/client-runtime/connection/driver/ConnectionDriver") {}
 
@@ -183,7 +188,12 @@ export const make = Effect.gen(function* () {
       Effect.withSpan("ConnectionDriver.preflight"),
     );
 
-  return ConnectionDriver.of({ connect, checkRoute, preflight });
+  return ConnectionDriver.of({
+    connect,
+    checkRoute,
+    preflight,
+    renewCredential: resolver.renewCredential,
+  });
 });
 
 export const layer = Layer.effect(ConnectionDriver, make);

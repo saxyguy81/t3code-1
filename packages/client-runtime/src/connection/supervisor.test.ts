@@ -252,6 +252,7 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
         checkRoute: (_entry, route) => checkRoute(route),
         preflight: (_entry, route) =>
           checkRoute(route).pipe(Effect.map((check) => check === "answered")),
+        renewCredential: () => Effect.succeedNone,
       }),
     ),
   );

@@ -8,12 +8,14 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as ConnectionResolver from "./resolver.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import {
   BearerConnectionCredential,
+  BearerConnectionProfile,
   type ConnectionCatalogEntry,
   SshConnectionProfile,
   type ConnectionCredential,
@@ -21,6 +23,7 @@ import {
 } from "./catalog.ts";
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import {
+  BearerConnectionTarget,
   ConnectionTransientError,
   PrimaryConnectionTarget,
   SshConnectionTarget,
@@ -62,6 +65,8 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly primaryBearerToken?: string;
   readonly prepareSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["prepare"];
   readonly descriptorProtocolVersion?: number | null | undefined;
+  readonly renewSession?: (request: Request) => Response;
+  readonly onCredentialPut?: (connectionId: string, credential: ConnectionCredential) => void;
 }) => {
   const profiles = new Map(
     (options?.profiles ?? []).map((profile) => [profile.connectionId, profile]),
@@ -76,7 +81,10 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   const credentialStore = ConnectionCredentialStore.ConnectionCredentialStore.of({
     get: (connectionId) => Effect.succeed(Option.fromNullishOr(credentials.get(connectionId))),
     put: (connectionId, credential) =>
-      Effect.sync(() => void credentials.set(connectionId, credential)),
+      Effect.sync(() => {
+        options?.onCredentialPut?.(connectionId, credential);
+        credentials.set(connectionId, credential);
+      }),
     remove: (connectionId) => Effect.sync(() => void credentials.delete(connectionId)),
   });
   const remote = RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization.of({
@@ -127,8 +135,15 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   });
 
   const layerDependencies = Layer.mergeAll(
-    RpcHttp.layerRemoteHttpClient((() =>
-      Promise.resolve(
+    RpcHttp.layerRemoteHttpClient(((input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      if (new URL(request.url).pathname === "/api/auth/session/renew") {
+        return Promise.resolve(
+          options?.renewSession?.(request) ??
+            Response.json({ code: "not_found", reason: "not_found" }, { status: 404 }),
+        );
+      }
+      return Promise.resolve(
         Response.json({
           environmentId: ENVIRONMENT_ID,
           label: "Compatible environment",
@@ -141,7 +156,8 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
               : { orchestrationProtocolVersion: options.descriptorProtocolVersion }),
           capabilities: { repositoryIdentity: true },
         }),
-      )) satisfies typeof fetch),
+      );
+    }) satisfies typeof fetch),
     Layer.succeed(
       ConnectionProfileStore.ConnectionProfileStore,
       options?.profileStore ?? profileStore,
@@ -205,6 +221,87 @@ describe("ConnectionResolver", () => {
         httpAuthorization: null,
         target,
       });
+    }),
+  );
+
+  it.effect("renews a saved bearer session on connect and stores the token before using it", () =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const renewAuthorizations: Array<string | null> = [];
+      const target = new BearerConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "Phone",
+        connectionId: "saved-1",
+      });
+      const profile = new BearerConnectionProfile({
+        connectionId: "saved-1",
+        environmentId: ENVIRONMENT_ID,
+        label: "Phone",
+        httpBaseUrl: ENDPOINT.httpBaseUrl,
+        wsBaseUrl: ENDPOINT.wsBaseUrl,
+      });
+      let renewal: Record<string, unknown> = {
+        renewed: true,
+        expiresAt: "2026-12-20T00:00:00.000Z",
+        access_token: "renewed-bearer",
+      };
+      const layerBroker = yield* makeDependencies({
+        credentials: [["saved-1", new BearerConnectionCredential({ token: "old-bearer" })]],
+        renewSession: (request) => {
+          renewAuthorizations.push(request.headers.get("authorization"));
+          return Response.json(renewal);
+        },
+        onCredentialPut: (connectionId, credential) =>
+          events.push(`put:${connectionId}:${credential.token}`),
+        authorizeBearer: (input) =>
+          Effect.sync(() => events.push(`authorize:${input.bearerToken}`)).pipe(
+            Effect.as({
+              environmentId: input.expectedEnvironmentId,
+              label: "Phone",
+              httpBaseUrl: input.httpBaseUrl,
+              socketUrl: "wss://environment.example.test/ws?wsTicket=ticket",
+              httpAuthorization: { _tag: "Bearer" as const, token: input.bearerToken },
+            }),
+          ),
+      });
+      const resolver = yield* ConnectionResolver.ConnectionResolver.pipe(
+        Effect.provide(layerBroker),
+      );
+      const entry = catalogEntry(target, Option.some(profile));
+
+      const prepared = yield* resolver.prepare(entry);
+      expect(renewAuthorizations).toEqual(["Bearer old-bearer"]);
+      expect(events).toEqual(["put:saved-1:renewed-bearer", "authorize:renewed-bearer"]);
+      expect(prepared.httpAuthorization).toEqual({ _tag: "Bearer", token: "renewed-bearer" });
+
+      // Reconnects and route checks within the hour do not ask again.
+      yield* resolver.prepare(entry);
+      expect(renewAuthorizations).toHaveLength(1);
+
+      // A live connection renews on its daily check, keeping the token when
+      // the server says it is not due.
+      renewal = { renewed: false, reason: "not_due", expiresAt: "2026-12-20T00:00:00.000Z" };
+      yield* TestClock.adjust("2 hours");
+      expect(yield* resolver.renewCredential(prepared)).toEqual(Option.none());
+      expect(renewAuthorizations).toEqual(["Bearer old-bearer", "Bearer renewed-bearer"]);
+
+      renewal = {
+        renewed: true,
+        expiresAt: "2027-01-19T00:00:00.000Z",
+        access_token: "renewed-again",
+      };
+      yield* TestClock.adjust("2 hours");
+      const renewedLive = yield* resolver.renewCredential(prepared);
+      expect(Option.map(renewedLive, (value) => value.httpAuthorization)).toEqual(
+        Option.some({ _tag: "Bearer", token: "renewed-again" }),
+      );
+      expect(events.at(-1)).toBe("put:saved-1:renewed-again");
+
+      // A failed renewal never blocks the connection.
+      renewal = {};
+      yield* TestClock.adjust("2 hours");
+      const afterFailure = yield* resolver.prepare(entry);
+      expect(afterFailure.httpAuthorization).toEqual({ _tag: "Bearer", token: "renewed-again" });
     }),
   );
 

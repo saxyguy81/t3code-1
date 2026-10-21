@@ -391,6 +391,21 @@ export const AuthSessionState = Schema.Struct({
 });
 export type AuthSessionState = typeof AuthSessionState.Type;
 
+/**
+ * The answer to `POST /api/auth/session/renew`. A renewed session keeps its id,
+ * so live sockets stay up. Bearer clients get the new token in `access_token`;
+ * cookie sessions get it as a refreshed cookie instead. A refusal says why: the
+ * session is not near expiry yet, reached its 180-day lifetime, or is a kind
+ * that never renews (proof-bound tokens re-exchange instead).
+ */
+export const AuthSessionRenewResult = Schema.Struct({
+  renewed: Schema.Boolean,
+  reason: Schema.optionalKey(Schema.Literals(["not_due", "max_lifetime", "not_renewable"])),
+  expiresAt: Schema.DateTimeUtc,
+  access_token: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type AuthSessionRenewResult = typeof AuthSessionRenewResult.Type;
+
 export const AuthMcpClientAccess = Schema.Literals([
   "read-only",
   "approval-required",

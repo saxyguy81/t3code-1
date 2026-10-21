@@ -41,6 +41,10 @@ export const AuthSessionRecord = Schema.Struct({
   expiresAt: Schema.DateTimeUtcFromString,
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   revokedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  /** When the session was last renewed; null until its first renewal. */
+  renewedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  /** The expiry the token replaced by the last renewal carried. */
+  previousExpiresAt: Schema.NullOr(Schema.DateTimeUtcFromString),
 });
 export type AuthSessionRecord = typeof AuthSessionRecord.Type;
 
@@ -92,6 +96,17 @@ export const SetAuthSessionLastConnectedAtInput = Schema.Struct({
 });
 export type SetAuthSessionLastConnectedAtInput = typeof SetAuthSessionLastConnectedAtInput.Type;
 
+export const RenewAuthSessionInput = Schema.Struct({
+  sessionId: AuthSessionId,
+  /** The expiry the renewal replaces, kept for the grace window of its token. */
+  previousExpiresAt: Schema.DateTimeUtcFromString,
+  /** The last renewal the caller saw; the update applies only while it is still the last. */
+  previousRenewedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  expiresAt: Schema.DateTimeUtcFromString,
+  renewedAt: Schema.DateTimeUtcFromString,
+});
+export type RenewAuthSessionInput = typeof RenewAuthSessionInput.Type;
+
 export const SetAuthSessionClientConnectionInput = Schema.Struct({
   sessionId: AuthSessionId,
   surface: Schema.NullOr(ClientSurface),
@@ -126,6 +141,10 @@ export class AuthSessionRepository extends Context.Service<
     readonly setLastConnectedAt: (
       input: SetAuthSessionLastConnectedAtInput,
     ) => Effect.Effect<void, AuthSessionRepositoryError>;
+    /** Moves an active session's expiry forward; false when it is revoked or already renewed. */
+    readonly renew: (
+      input: RenewAuthSessionInput,
+    ) => Effect.Effect<boolean, AuthSessionRepositoryError>;
     readonly setClientConnection: (
       input: SetAuthSessionClientConnectionInput,
     ) => Effect.Effect<void, AuthSessionRepositoryError>;
@@ -147,6 +166,8 @@ const AuthSessionDbRow = Schema.Struct({
   expiresAt: Schema.DateTimeUtcFromString,
   lastConnectedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
   revokedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  renewedAt: Schema.NullOr(Schema.DateTimeUtcFromString),
+  previousExpiresAt: Schema.NullOr(Schema.DateTimeUtcFromString),
 });
 
 const AuthSessionRawDbRow = Schema.Struct({
@@ -164,6 +185,8 @@ const AuthSessionRawDbRow = Schema.Struct({
   expiresAt: Schema.Unknown,
   lastConnectedAt: Schema.Unknown,
   revokedAt: Schema.Unknown,
+  renewedAt: Schema.Unknown,
+  previousExpiresAt: Schema.Unknown,
 });
 
 const decodeAuthSessionDbRow = Schema.decodeUnknownEffect(AuthSessionDbRow);
@@ -186,6 +209,8 @@ function toAuthSessionRecord(row: typeof AuthSessionDbRow.Type): AuthSessionReco
     expiresAt: row.expiresAt,
     lastConnectedAt: row.lastConnectedAt,
     revokedAt: row.revokedAt,
+    renewedAt: row.renewedAt,
+    previousExpiresAt: row.previousExpiresAt,
   };
 }
 
@@ -268,7 +293,9 @@ export const make = Effect.gen(function* () {
           issued_at AS "issuedAt",
           expires_at AS "expiresAt",
           last_connected_at AS "lastConnectedAt",
-          revoked_at AS "revokedAt"
+          revoked_at AS "revokedAt",
+          renewed_at AS "renewedAt",
+          previous_expires_at AS "previousExpiresAt"
         FROM auth_sessions
         WHERE session_id = ${sessionId}
       `,
@@ -312,7 +339,9 @@ export const make = Effect.gen(function* () {
           issued_at AS "issuedAt",
           expires_at AS "expiresAt",
           last_connected_at AS "lastConnectedAt",
-          revoked_at AS "revokedAt"
+          revoked_at AS "revokedAt",
+          renewed_at AS "renewedAt",
+          previous_expires_at AS "previousExpiresAt"
         FROM auth_sessions
         WHERE revoked_at IS NULL
           AND (expires_at > ${now} OR ${sql.in("session_id", connectedSessionIds)})
@@ -328,6 +357,26 @@ export const make = Effect.gen(function* () {
         SET last_connected_at = ${lastConnectedAt}
         WHERE session_id = ${sessionId}
           AND revoked_at IS NULL
+      `,
+  });
+
+  const renewSessionRows = SqlSchema.findAll({
+    Request: RenewAuthSessionInput,
+    Result: Schema.Struct({ sessionId: AuthSessionId }),
+    execute: ({ sessionId, previousExpiresAt, previousRenewedAt, expiresAt, renewedAt }) =>
+      sql`
+        UPDATE auth_sessions
+        SET expires_at = ${expiresAt},
+            renewed_at = ${renewedAt},
+            previous_expires_at = ${previousExpiresAt}
+        WHERE session_id = ${sessionId}
+          AND revoked_at IS NULL
+          AND ${
+            previousRenewedAt === null
+              ? sql`renewed_at IS NULL`
+              : sql`renewed_at = ${previousRenewedAt}`
+          }
+        RETURNING session_id AS "sessionId"
       `,
   });
 
@@ -500,6 +549,18 @@ export const make = Effect.gen(function* () {
       ),
     );
 
+  const renew: AuthSessionRepository["Service"]["renew"] = (input) =>
+    renewSessionRows(input).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "AuthSessionRepository.renew:query",
+          "AuthSessionRepository.renew:encodeRequest",
+          { sessionId: input.sessionId },
+        ),
+      ),
+      Effect.map((rows) => rows.length > 0),
+    );
+
   const setClientConnection: AuthSessionRepository["Service"]["setClientConnection"] = (input) =>
     setClientConnectionRow(input).pipe(
       Effect.mapError(
@@ -520,6 +581,7 @@ export const make = Effect.gen(function* () {
     revoke,
     revokeAllExcept,
     setLastConnectedAt,
+    renew,
     setClientConnection,
   } satisfies AuthSessionRepository["Service"];
 });

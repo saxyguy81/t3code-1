@@ -18,7 +18,11 @@ import {
   EnvironmentAuthenticatedAuth,
   EnvironmentAuthenticatedPrincipal,
 } from "@t3tools/contracts";
-import type { AuthEnvironmentScope, DpopFailureReason } from "@t3tools/contracts";
+import type {
+  AuthEnvironmentScope,
+  AuthSessionRenewResult,
+  DpopFailureReason,
+} from "@t3tools/contracts";
 import { parseOAuthScope } from "@t3tools/shared/oauthScope";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as Clock from "effect/Clock";
@@ -280,11 +284,28 @@ export const layer = HttpApiBuilder.group(
               sessions.legacyCookieName,
             );
             if (
-              credential?.source === "legacy-cookie" &&
-              result.authenticated &&
-              result.sessionMethod === "browser-session-cookie" &&
-              result.expiresAt
+              !credential ||
+              !EnvironmentAuth.isBrowserCookieCredential(credential.source) ||
+              !result.authenticated ||
+              result.sessionMethod !== "browser-session-cookie" ||
+              !result.expiresAt
             ) {
+              return result;
+            }
+            // The web app reads this on load and while open, so a cookie session
+            // near expiry renews here without a separate call.
+            const renewal = yield* serverAuth.renewSession(request).pipe(
+              Effect.map(({ renewal }) => (renewal.renewed ? renewal.session : undefined)),
+              Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, () =>
+                Effect.succeed(undefined),
+              ),
+            );
+            if (renewal) {
+              yield* appendSessionCookie(sessions.cookieName, renewal.token, renewal.expiresAt);
+              yield* appendCredentialResponseHeaders;
+              return { ...result, expiresAt: DateTime.toUtc(renewal.expiresAt) };
+            }
+            if (credential.source === "legacy-cookie") {
               yield* appendSessionCookie(sessions.cookieName, credential.token, result.expiresAt);
               yield* appendCredentialResponseHeaders;
             }
@@ -409,6 +430,52 @@ export const layer = HttpApiBuilder.group(
           ),
           Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
             failEnvironmentInternal("access_token_issuance_failed", error),
+          ),
+        ),
+      )
+      .handle(
+        "renewSession",
+        Effect.fn("environment.auth.renewSession")(
+          function* (args) {
+            yield* annotateEnvironmentRequest(args.endpoint.name);
+            const request = yield* HttpServerRequest.HttpServerRequest;
+            const { renewal, browserCookie } = yield* serverAuth
+              .renewSession(request)
+              .pipe(
+                Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, (error) =>
+                  failEnvironmentAuthInvalid(
+                    EnvironmentAuth.serverAuthCredentialReason(error),
+                    EnvironmentAuth.serverAuthDpopFailureReason(error),
+                  ),
+                ),
+              );
+            yield* appendCredentialResponseHeaders;
+            if (!renewal.renewed) {
+              return {
+                renewed: false,
+                reason: renewal.reason,
+                expiresAt: DateTime.toUtc(renewal.expiresAt),
+              } satisfies AuthSessionRenewResult;
+            }
+            if (browserCookie) {
+              yield* appendSessionCookie(
+                sessions.cookieName,
+                renewal.session.token,
+                renewal.session.expiresAt,
+              );
+              return {
+                renewed: true,
+                expiresAt: DateTime.toUtc(renewal.session.expiresAt),
+              } satisfies AuthSessionRenewResult;
+            }
+            return {
+              renewed: true,
+              expiresAt: DateTime.toUtc(renewal.session.expiresAt),
+              access_token: renewal.session.token,
+            } satisfies AuthSessionRenewResult;
+          },
+          Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+            failEnvironmentInternal("session_renewal_failed", error),
           ),
         ),
       )

@@ -3,17 +3,20 @@ import type {
   ExecutionEnvironmentDescriptor,
 } from "@t3tools/contracts";
 import { withRelayClientTracing } from "@t3tools/shared/relayTracing";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as HttpClient from "effect/http/HttpClient";
 
 import {
   appendClientConnectionParams,
   type ClientOwnerParams,
   readClientOwnerParams,
+  renewRemoteBearerSession,
 } from "../authorization/remote.ts";
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
@@ -42,6 +45,7 @@ import type {
   RelayConnectionTarget,
   SshConnectionTarget,
 } from "./model.ts";
+import { safeErrorLogAttributes } from "../errors/safeLog.ts";
 import { ConnectionBlockedError, type ConnectionAttemptError } from "./model.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
 import {
@@ -68,10 +72,22 @@ export class ConnectionResolver extends Context.Service<
       },
       ConnectionAttemptError
     >;
+    /**
+     * Renews a prepared bearer connection's session when the server says it is
+     * near expiry, and returns the connection with the new token. Never fails:
+     * the old token keeps working until its own expiry.
+     */
+    readonly renewCredential: (
+      prepared: PreparedConnection,
+    ) => Effect.Effect<Option.Option<PreparedConnection>>;
   }
 >()("@t3tools/client-runtime/connection/resolver/ConnectionResolver") {}
 
 const isBearerProfile = Schema.is(BearerConnectionProfile);
+// The server renews a session only in its last week, so asking more than
+// hourly (every reconnect and route check prepares) would only cost requests.
+const BEARER_RENEWAL_ATTEMPT_INTERVAL_MS = 60 * 60_000;
+const BEARER_RENEWAL_TIMEOUT_MS = 5_000;
 const isSshProfile = Schema.is(SshConnectionProfile);
 const isBearerCredential = Schema.is(BearerConnectionCredential);
 
@@ -122,7 +138,81 @@ const makePrimaryBroker = Effect.fn("clientRuntime.connection.broker.makePrimary
   });
 });
 
-const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")(function* () {
+type BearerCredentialRenewal = (input: {
+  readonly credentialId: string;
+  readonly httpBaseUrl: string;
+  readonly token: string;
+}) => Effect.Effect<string>;
+
+/**
+ * Returns the token a bearer connection should use, renewing its session first
+ * when the server says it is near expiry. The renewed token is stored before
+ * it is used; the replaced one keeps working for a short grace window, so
+ * requests already holding it finish. One renewal runs at a time, and a caller
+ * holding a token another caller already replaced gets the stored one.
+ */
+const makeBearerCredentialRenewal = Effect.fn("clientRuntime.connection.makeBearerRenewal")(
+  function* () {
+    const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
+    const httpClient = yield* HttpClient.HttpClient;
+    const lock = yield* Semaphore.make(1);
+    const lastAttemptAt = new Map<string, number>();
+
+    const renew: BearerCredentialRenewal = Effect.fn("clientRuntime.connection.renewBearer")(
+      function* (input) {
+        const stored = yield* credentials
+          .get(input.credentialId)
+          .pipe(Effect.orElseSucceed(() => Option.none()));
+        if (
+          Option.isSome(stored) &&
+          isBearerCredential(stored.value) &&
+          stored.value.token !== input.token
+        ) {
+          return stored.value.token;
+        }
+        const now = yield* Clock.currentTimeMillis;
+        const last = lastAttemptAt.get(input.credentialId);
+        if (last !== undefined && now - last < BEARER_RENEWAL_ATTEMPT_INTERVAL_MS) {
+          return input.token;
+        }
+        lastAttemptAt.set(input.credentialId, now);
+        const result = yield* renewRemoteBearerSession({
+          httpBaseUrl: input.httpBaseUrl,
+          bearerToken: input.token,
+          timeoutMs: BEARER_RENEWAL_TIMEOUT_MS,
+        }).pipe(
+          Effect.provideService(HttpClient.HttpClient, httpClient),
+          Effect.tapError((error) =>
+            Effect.logDebug("Could not renew the bearer session; keeping the current token.").pipe(
+              Effect.annotateLogs({ ...safeErrorLogAttributes(error) }),
+            ),
+          ),
+          Effect.option,
+        );
+        if (Option.isNone(result) || !result.value.renewed || !result.value.access_token) {
+          return input.token;
+        }
+        const renewedToken = result.value.access_token;
+        yield* credentials
+          .put(input.credentialId, new BearerConnectionCredential({ token: renewedToken }))
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("Could not store the renewed bearer token.").pipe(
+                Effect.annotateLogs({ ...safeErrorLogAttributes(error) }),
+              ),
+            ),
+          );
+        return renewedToken;
+      },
+      lock.withPermits(1),
+    );
+    return renew;
+  },
+);
+
+const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")(function* (
+  renewBearerCredential: BearerCredentialRenewal,
+) {
   const credentials = yield* ConnectionCredentialStore.ConnectionCredentialStore;
   const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
 
@@ -152,7 +242,8 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
       });
       return { ...authorized, target } satisfies PreparedConnection;
     }
-    const credential = yield* credentials.get(credentialConnectionId(target.connectionId)).pipe(
+    const credentialId = credentialConnectionId(target.connectionId);
+    const credential = yield* credentials.get(credentialId).pipe(
       Effect.flatMap(
         Option.match({
           onNone: () => Effect.fail(credentialMissingError(target.connectionId)),
@@ -163,11 +254,16 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
     if (!isBearerCredential(credential)) {
       return yield* credentialMissingError(target.connectionId);
     }
+    const bearerToken = yield* renewBearerCredential({
+      credentialId,
+      httpBaseUrl: profile.httpBaseUrl,
+      token: credential.token,
+    });
     const authorized = yield* remote.authorizeBearer({
       expectedEnvironmentId: target.environmentId,
       httpBaseUrl: profile.httpBaseUrl,
       wsBaseUrl: profile.wsBaseUrl,
-      bearerToken: credential.token,
+      bearerToken,
       connectionMethod: "direct",
     });
     return {
@@ -277,8 +373,9 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(funct
 
 /** @public Service construction is part of the canonical Effect module API. */
 export const make = Effect.gen(function* () {
+  const renewBearerCredential = yield* makeBearerCredentialRenewal();
   const primary = yield* makePrimaryBroker();
-  const bearer = yield* makeBearerBroker();
+  const bearer = yield* makeBearerBroker(renewBearerCredential);
   const relay = yield* makeRelayBroker();
   const ssh = yield* makeSshBroker();
   const httpClient = yield* HttpClient.HttpClient;
@@ -332,7 +429,27 @@ export const make = Effect.gen(function* () {
     };
   });
 
-  return ConnectionResolver.of({ prepare, prepareForUpdate: authorize });
+  // Only saved bearer connections renew: desktop and SSH bearers are minted
+  // again on every start, and T3 Connect tokens re-exchange on their own.
+  const renewCredential = (prepared: PreparedConnection) => {
+    const authorization = prepared.httpAuthorization;
+    if (prepared.target._tag !== "BearerConnectionTarget" || authorization?._tag !== "Bearer") {
+      return Effect.succeedNone;
+    }
+    return renewBearerCredential({
+      credentialId: credentialConnectionId(prepared.target.connectionId),
+      httpBaseUrl: prepared.httpBaseUrl,
+      token: authorization.token,
+    }).pipe(
+      Effect.map((token) =>
+        token === authorization.token
+          ? Option.none<PreparedConnection>()
+          : Option.some({ ...prepared, httpAuthorization: { _tag: "Bearer" as const, token } }),
+      ),
+    );
+  };
+
+  return ConnectionResolver.of({ prepare, prepareForUpdate: authorize, renewCredential });
 });
 
 export const layer = Layer.effect(ConnectionResolver, make);

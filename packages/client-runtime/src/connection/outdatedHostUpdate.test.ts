@@ -70,6 +70,7 @@ describe("describeOutdatedHost", () => {
           ConnectionResolver.ConnectionResolver,
           ConnectionResolver.ConnectionResolver.of({
             prepare: () => Effect.die(new Error("normal sessions reject this protocol")),
+            renewCredential: () => Effect.succeedNone,
             prepareForUpdate: (entry) =>
               Effect.succeed({
                 descriptor: expected,
@@ -185,6 +186,7 @@ describe("updateOutdatedHost", () => {
       } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
       const resolver = ConnectionResolver.ConnectionResolver.of({
         prepare: () => Effect.die(new Error("The update must bypass the protocol gate.")),
+        renewCredential: () => Effect.succeedNone,
         prepareForUpdate: () =>
           Effect.sync(() => served).pipe(
             Effect.map((current) => ({
@@ -276,6 +278,7 @@ describe("updateOutdatedHost", () => {
               ConnectionResolver.ConnectionResolver,
               ConnectionResolver.ConnectionResolver.of({
                 prepare: () => Effect.die(new Error("unused")),
+                renewCredential: () => Effect.succeedNone,
                 prepareForUpdate: () =>
                   Effect.succeed({
                     descriptor: manual,

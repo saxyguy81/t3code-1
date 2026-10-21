@@ -547,6 +547,18 @@ export class EnvironmentAuth extends Context.Service<
     readonly issueWebSocketTicket: (
       session: Pick<AuthenticatedSession, "sessionId">,
     ) => Effect.Effect<AuthWebSocketTicketResult, ServerAuthInternalError>;
+    /**
+     * Renews the cookie or bearer session a request authenticates with, when
+     * it is near expiry. `browserCookie` tells the caller to answer with a
+     * cookie rather than a token.
+     */
+    readonly renewSession: (request: HttpServerRequest.HttpServerRequest) => Effect.Effect<
+      {
+        readonly renewal: SessionStore.SessionRenewal;
+        readonly browserCookie: boolean;
+      },
+      ServerAuthCredentialError | ServerAuthInternalError
+    >;
     readonly issueStartupPairingUrl: (
       baseUrl: string,
     ) => Effect.Effect<string, ServerAuthInternalError>;
@@ -857,6 +869,18 @@ export const make = Effect.gen(function* () {
       ),
       Effect.withSpan("EnvironmentAuth.getSessionState"),
     );
+
+  const renewSession: EnvironmentAuth["Service"]["renewSession"] = Effect.fn(
+    "EnvironmentAuth.renewSession",
+  )(function* (request) {
+    yield* authenticateRequest(request);
+    const credential = resolveRequestCredential(request);
+    if (!credential?.token) {
+      return yield* new ServerAuthMissingCredentialError({});
+    }
+    const renewal = yield* sessions.renew(credential.token).pipe(mapSessionVerificationErrors);
+    return { renewal, browserCookie: isBrowserCookieCredential(credential.source) };
+  });
 
   const createBrowserSession: EnvironmentAuth["Service"]["createBrowserSession"] = Effect.fn(
     "EnvironmentAuth.createBrowserSession",
@@ -1363,6 +1387,7 @@ export const make = Effect.gen(function* () {
     authenticateHttpRequest,
     authenticateWebSocketUpgrade,
     issueWebSocketTicket,
+    renewSession,
     issueStartupPairingUrl,
     authenticateMcpClient,
     issueMcpClientSession,
