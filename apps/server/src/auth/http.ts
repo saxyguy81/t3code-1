@@ -299,6 +299,13 @@ export const layer = HttpApiBuilder.group(
               Effect.catchIf(EnvironmentAuth.isServerAuthCredentialError, () =>
                 Effect.succeed(undefined),
               ),
+              // The session is valid either way; a failed renewal only means
+              // the next read tries again.
+              Effect.catchIf(EnvironmentAuth.isServerAuthInternalError, (error) =>
+                Effect.logWarning("Could not renew the browser session.", {
+                  errorTag: error._tag,
+                }).pipe(Effect.as(undefined)),
+              ),
             );
             if (renewal) {
               yield* appendSessionCookie(sessions.cookieName, renewal.token, renewal.expiresAt);

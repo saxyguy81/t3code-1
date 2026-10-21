@@ -8,6 +8,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as HttpClient from "effect/http/HttpClient";
@@ -19,6 +20,7 @@ import {
   renewRemoteBearerSession,
 } from "../authorization/remote.ts";
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
+import type { RemoteEnvironmentRequestError } from "../rpc/http.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import {
   BearerConnectionCredential,
@@ -88,6 +90,24 @@ const isBearerProfile = Schema.is(BearerConnectionProfile);
 // hourly (every reconnect and route check prepares) would only cost requests.
 const BEARER_RENEWAL_ATTEMPT_INTERVAL_MS = 60 * 60_000;
 const BEARER_RENEWAL_TIMEOUT_MS = 5_000;
+const BEARER_RENEWAL_RETRIES = 2;
+const BEARER_RENEWAL_RETRY_DELAY = "2 seconds";
+// The answer may have been lost after the server renewed: no response, a
+// timeout, a garbled body or a server error. A 4xx (including the 404 of a host
+// without the route) is the server's answer and is not asked again.
+const isRetryableRenewalError = (error: RemoteEnvironmentRequestError) => {
+  switch (error._tag) {
+    case "RemoteEnvironmentAuthFetchError":
+    case "RemoteEnvironmentAuthTimeoutError":
+    case "RemoteEnvironmentAuthInvalidJsonError":
+    case "EnvironmentInternalError":
+      return true;
+    case "RemoteEnvironmentAuthUndeclaredStatusError":
+      return error.status >= 500;
+    default:
+      return false;
+  }
+};
 const isSshProfile = Schema.is(SshConnectionProfile);
 const isBearerCredential = Schema.is(BearerConnectionCredential);
 
@@ -157,31 +177,63 @@ const makeBearerCredentialRenewal = Effect.fn("clientRuntime.connection.makeBear
     const httpClient = yield* HttpClient.HttpClient;
     const lock = yield* Semaphore.make(1);
     const lastAttemptAt = new Map<string, number>();
+    // A renewed token the store refused, kept for this run in place of the
+    // stored token it replaced, which stops working once the grace window ends.
+    const unsaved = new Map<string, { readonly replaced: string; readonly token: string }>();
+
+    const storeToken = (credentialId: string, token: string) =>
+      credentials.put(credentialId, new BearerConnectionCredential({ token })).pipe(
+        Effect.as(true),
+        Effect.catch((error) =>
+          Effect.logWarning("Could not store the renewed bearer token.").pipe(
+            Effect.annotateLogs({ ...safeErrorLogAttributes(error) }),
+            Effect.as(false),
+          ),
+        ),
+      );
 
     const renew: BearerCredentialRenewal = Effect.fn("clientRuntime.connection.renewBearer")(
       function* (input) {
         const stored = yield* credentials
           .get(input.credentialId)
           .pipe(Effect.orElseSucceed(() => Option.none()));
-        if (
-          Option.isSome(stored) &&
-          isBearerCredential(stored.value) &&
-          stored.value.token !== input.token
-        ) {
-          return stored.value.token;
+        const storedToken =
+          Option.isSome(stored) && isBearerCredential(stored.value) ? stored.value.token : undefined;
+        const pending = unsaved.get(input.credentialId);
+        let current = input.token;
+        let saved = storedToken;
+        if (pending !== undefined && storedToken === pending.replaced) {
+          current = pending.token;
+          if (yield* storeToken(input.credentialId, current)) {
+            unsaved.delete(input.credentialId);
+            saved = current;
+          }
+        } else {
+          unsaved.delete(input.credentialId);
+          if (storedToken !== undefined && storedToken !== input.token) {
+            return storedToken;
+          }
         }
         const now = yield* Clock.currentTimeMillis;
         const last = lastAttemptAt.get(input.credentialId);
         if (last !== undefined && now - last < BEARER_RENEWAL_ATTEMPT_INTERVAL_MS) {
-          return input.token;
+          return current;
         }
         lastAttemptAt.set(input.credentialId, now);
+        // The server may have committed a renewal whose answer was lost; it
+        // hands the same token out again only inside its grace window, so
+        // retry now rather than at the next hourly or daily attempt.
         const result = yield* renewRemoteBearerSession({
           httpBaseUrl: input.httpBaseUrl,
-          bearerToken: input.token,
+          bearerToken: current,
           timeoutMs: BEARER_RENEWAL_TIMEOUT_MS,
         }).pipe(
           Effect.provideService(HttpClient.HttpClient, httpClient),
+          Effect.retry({
+            times: BEARER_RENEWAL_RETRIES,
+            schedule: Schedule.spaced(BEARER_RENEWAL_RETRY_DELAY),
+            while: isRetryableRenewalError,
+          }),
           Effect.tapError((error) =>
             Effect.logDebug("Could not renew the bearer session; keeping the current token.").pipe(
               Effect.annotateLogs({ ...safeErrorLogAttributes(error) }),
@@ -189,19 +241,19 @@ const makeBearerCredentialRenewal = Effect.fn("clientRuntime.connection.makeBear
           ),
           Effect.option,
         );
-        if (Option.isNone(result) || !result.value.renewed || !result.value.access_token) {
-          return input.token;
+        if (Option.isNone(result)) {
+          lastAttemptAt.delete(input.credentialId);
+          return current;
+        }
+        if (!result.value.renewed || !result.value.access_token) {
+          return current;
         }
         const renewedToken = result.value.access_token;
-        yield* credentials
-          .put(input.credentialId, new BearerConnectionCredential({ token: renewedToken }))
-          .pipe(
-            Effect.catch((error) =>
-              Effect.logWarning("Could not store the renewed bearer token.").pipe(
-                Effect.annotateLogs({ ...safeErrorLogAttributes(error) }),
-              ),
-            ),
-          );
+        if (yield* storeToken(input.credentialId, renewedToken)) {
+          unsaved.delete(input.credentialId);
+        } else if (saved !== undefined) {
+          unsaved.set(input.credentialId, { replaced: saved, token: renewedToken });
+        }
         return renewedToken;
       },
       lock.withPermits(1),
